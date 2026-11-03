@@ -19,6 +19,16 @@ from .colony import (
     entangle_colony,
 )
 from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
+from .reliability import (
+    EXEC_TASK_TIMEOUT_SECONDS,
+    FILE_TASK_TIMEOUT_SECONDS,
+    HTTP_TASK_TIMEOUT_SECONDS,
+    MODEL_TASK_TIMEOUT_SECONDS,
+    cap_aggregate_output,
+    run_parallel,
+    validate_parallel_items,
+    validate_parallel_payload,
+)
 
 
 
@@ -137,20 +147,26 @@ CODE TO ANALYZE:
 REFACTORING SUGGESTIONS:"""
     }
     
-    # Execute all 4 reviews in parallel using ThreadPoolExecutor
+    # Execute all 4 reviews in parallel, off the event loop, with a
+    # per-review timeout. The shared parallel runner returns results
+    # in input order, so callers do not depend on completion order.
+    review_types = list(prompts.keys())
+    raw_results = await asyncio.to_thread(
+        run_parallel,
+        [
+            (lambda p=prompts[t]: sync_query_raw(model, p))
+            for t in review_types
+        ],
+        max_workers=4,
+        timeout=MODEL_TASK_TIMEOUT_SECONDS,
+    )
     results = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(sync_query_raw, model, prompt): review_type
-            for review_type, prompt in prompts.items()
-        }
-        for future in as_completed(futures):
-            review_type = futures[future]
-            try:
-                results[review_type] = future.result()
-            except Exception as e:
-                results[review_type] = f"Error: {str(e)}"
-    
+    for review_type, raw in zip(review_types, raw_results):
+        if isinstance(raw, dict):
+            results[review_type] = f"Error: {raw.get('error', 'unknown error')}"
+        else:
+            results[review_type] = raw
+
     elapsed = time.time() - start
     
     return {
@@ -231,19 +247,23 @@ RULES:
 EXAMPLES:"""
     }
     
+    gen_types = list(prompts.keys())
+    raw_results = await asyncio.to_thread(
+        run_parallel,
+        [
+            (lambda p=prompts[t]: sync_query_raw(model, p))
+            for t in gen_types
+        ],
+        max_workers=4,
+        timeout=MODEL_TASK_TIMEOUT_SECONDS,
+    )
     results = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(sync_query_raw, model, prompt): gen_type
-            for gen_type, prompt in prompts.items()
-        }
-        for future in as_completed(futures):
-            gen_type = futures[future]
-            try:
-                results[gen_type] = future.result()
-            except Exception as e:
-                results[gen_type] = f"Error: {str(e)}"
-    
+    for gen_type, raw in zip(gen_types, raw_results):
+        if isinstance(raw, dict):
+            results[gen_type] = f"Error: {raw.get('error', 'unknown error')}"
+        else:
+            results[gen_type] = raw
+
     elapsed = time.time() - start
     return {
         "spec": spec[:100] + "..." if len(spec) > 100 else spec,
@@ -264,11 +284,21 @@ async def file_swarm(operations: str) -> dict:
     import time
     start = time.time()
     
+    payload_error = validate_parallel_payload(operations, "operations")
+    if payload_error:
+        return {"error": payload_error}
     try:
         ops = json.loads(operations)
     except json.JSONDecodeError:
         return {"error": "Invalid JSON for operations"}
-    
+
+    items_error = validate_parallel_items(ops, "operations")
+    if items_error:
+        return {"error": items_error}
+    for op in ops:
+        if not isinstance(op, dict) or not isinstance(op.get("action"), str):
+            return {"error": "Each operation must be an object with a string 'action'"}
+
     def execute_file_op(op: dict) -> dict:
         action = op.get("action", "")
         raw_path = op.get("path", "")
@@ -336,17 +366,27 @@ async def file_swarm(operations: str) -> dict:
 
     # Cap workers like exec_swarm (8): the old max_workers=len(ops) let a
     # huge operation list spike threads. Results are returned in input
-    # order (not as_completed order), so callers can match results to ops.
-    results = [None] * len(ops)
-    with ThreadPoolExecutor(max_workers=max(1, min(len(ops), 8))) as executor:
-        futures = {executor.submit(execute_file_op, op): i for i, op in enumerate(ops)}
-        for future in as_completed(futures):
-            results[futures[future]] = future.result()
-    
+    # order, so callers can match results to ops, and the total text
+    # returned is capped (see reliability.cap_aggregate_output).
+    raw_results = await asyncio.to_thread(
+        run_parallel,
+        [(lambda o=op: execute_file_op(o)) for op in ops],
+        max_workers=min(len(ops), 8),
+        timeout=FILE_TASK_TIMEOUT_SECONDS,
+    )
+    results = []
+    for raw in raw_results:
+        if isinstance(raw, dict) and "action" not in raw:
+            results.append({"action": "", "error": raw.get("error", "unknown error"), "status": "failed"})
+        else:
+            results.append(raw)
+    results, output_truncated = cap_aggregate_output(results, ("content",))
+
     elapsed = time.time() - start
     return {
         "operations": len(ops),
         "results": results,
+        "output_truncated": output_truncated,
         "elapsed_seconds": round(elapsed, 2)
     }
 
@@ -369,10 +409,19 @@ async def exec_swarm(commands: str) -> dict:
     from .tools import tool_exec_cmd
     start = time.time()
 
+    payload_error = validate_parallel_payload(commands, "commands")
+    if payload_error:
+        return {"error": payload_error}
     try:
         cmds = json.loads(commands)
     except json.JSONDecodeError:
         cmds = [commands]  # Single command
+
+    items_error = validate_parallel_items(cmds, "commands")
+    if items_error:
+        return {"error": items_error}
+    if not all(isinstance(cmd, str) for cmd in cmds):
+        return {"error": "Each command must be a string"}
 
     def execute_cmd(cmd: str) -> dict:
         result = tool_exec_cmd(cmd)
@@ -390,16 +439,25 @@ async def exec_swarm(commands: str) -> dict:
             "status": "success" if result.get("returncode") == 0 else "failed",
         }
     
+    raw_results = await asyncio.to_thread(
+        run_parallel,
+        [(lambda c=cmd: execute_cmd(c)) for cmd in cmds],
+        max_workers=min(len(cmds), 8),
+        timeout=EXEC_TASK_TIMEOUT_SECONDS,
+    )
     results = []
-    with ThreadPoolExecutor(max_workers=min(len(cmds), 8)) as executor:
-        futures = [executor.submit(execute_cmd, cmd) for cmd in cmds]
-        for future in as_completed(futures):
-            results.append(future.result())
-    
+    for raw in raw_results:
+        if isinstance(raw, dict) and "command" not in raw:
+            results.append({"command": "", "error": raw.get("error", "unknown error"), "status": raw.get("status", "failed")})
+        else:
+            results.append(raw)
+    results, output_truncated = cap_aggregate_output(results, ("stdout", "stderr"))
+
     elapsed = time.time() - start
     return {
         "commands": len(cmds),
         "results": results,
+        "output_truncated": output_truncated,
         "elapsed_seconds": round(elapsed, 2)
     }
 
@@ -428,10 +486,20 @@ async def api_swarm(requests: str, allow_mutating: bool = False) -> dict:
     from .tools import _http_request
     start = time.time()
 
+    payload_error = validate_parallel_payload(requests, "requests")
+    if payload_error:
+        return {"error": payload_error}
     try:
         reqs = json.loads(requests)
     except json.JSONDecodeError:
         return {"error": "Invalid JSON for requests"}
+
+    items_error = validate_parallel_items(reqs, "requests")
+    if items_error:
+        return {"error": items_error}
+    for req in reqs:
+        if not isinstance(req, dict) or not isinstance(req.get("url"), str):
+            return {"error": "Each request must be an object with a string 'url'"}
 
     def execute_request(req: dict) -> dict:
         url = req.get("url", "")
@@ -462,16 +530,25 @@ async def api_swarm(requests: str, allow_mutating: bool = False) -> dict:
             "status": "success",
         }
     
+    raw_results = await asyncio.to_thread(
+        run_parallel,
+        [(lambda r=req: execute_request(r)) for req in reqs],
+        max_workers=min(len(reqs), 10),
+        timeout=HTTP_TASK_TIMEOUT_SECONDS,
+    )
     results = []
-    with ThreadPoolExecutor(max_workers=min(len(reqs), 10)) as executor:
-        futures = [executor.submit(execute_request, req) for req in reqs]
-        for future in as_completed(futures):
-            results.append(future.result())
-    
+    for raw in raw_results:
+        if isinstance(raw, dict) and "url" not in raw:
+            results.append({"url": "", "error": raw.get("error", "unknown error"), "status": raw.get("status", "failed")})
+        else:
+            results.append(raw)
+    results, output_truncated = cap_aggregate_output(results, ("body",))
+
     elapsed = time.time() - start
     return {
         "requests": len(reqs),
         "results": results,
+        "output_truncated": output_truncated,
         "elapsed_seconds": round(elapsed, 2)
     }
 
@@ -489,6 +566,9 @@ async def kmkb_swarm(queries: str, synthesize: bool = True) -> dict:
     
     KMKB_URL = "http://localhost:11434"  # Ollama for synthesis
     
+    payload_error = validate_parallel_payload(queries, "queries")
+    if payload_error:
+        return {"error": payload_error}
     try:
         q_list = json.loads(queries)
     except (json.JSONDecodeError, TypeError):
@@ -501,7 +581,12 @@ async def kmkb_swarm(queries: str, synthesize: bool = True) -> dict:
             f"What problems does {topic} solve?",
             f"How do I use {topic}?"
         ]
-    
+    items_error = validate_parallel_items(q_list, "queries")
+    if items_error:
+        return {"error": items_error}
+    if not all(isinstance(q, str) for q in q_list):
+        return {"error": "Each query must be a string"}
+
     def query_kmkb(query: str) -> dict:
         """Query KMKB via its search endpoint"""
         try:
@@ -532,14 +617,21 @@ async def kmkb_swarm(queries: str, synthesize: bool = True) -> dict:
         
         return {"query": query, "error": "No response", "status": "failed"}
     
-    results = []
     # Cap workers at 8 like exec_swarm/file_swarm: the old
     # max_workers=len(q_list) let a long query list spike threads.
-    with ThreadPoolExecutor(max_workers=max(1, min(len(q_list), 8))) as executor:
-        futures = [executor.submit(query_kmkb, q) for q in q_list]
-        for future in as_completed(futures):
-            results.append(future.result())
-    
+    raw_results = await asyncio.to_thread(
+        run_parallel,
+        [(lambda q=q: query_kmkb(q)) for q in q_list],
+        max_workers=min(len(q_list), 8),
+        timeout=HTTP_TASK_TIMEOUT_SECONDS,
+    )
+    results = []
+    for raw in raw_results:
+        if isinstance(raw, dict) and "query" not in raw:
+            results.append({"query": "", "error": raw.get("error", "unknown error"), "status": raw.get("status", "failed")})
+        else:
+            results.append(raw)
+
     # Synthesize if requested
     synthesis = None
     if synthesize and len(results) > 1:
@@ -553,7 +645,7 @@ async def kmkb_swarm(queries: str, synthesize: bool = True) -> dict:
 
 SYNTHESIS (be concise, extract key insights):"""
         
-        synthesis = sync_query_raw(MODEL_TIERS["synthesizer"], synth_prompt)
+        synthesis = await asyncio.to_thread(sync_query_raw, MODEL_TIERS["synthesizer"], synth_prompt)
     
     elapsed = time.time() - start
     return {
@@ -598,11 +690,18 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     colony = spawn_colony_internal(colony_type)
     
     # Parse tasks
+    payload_error = validate_parallel_payload(tasks, "tasks")
+    if payload_error:
+        return {"error": payload_error}
     try:
         task_list = json.loads(tasks)
     except (json.JSONDecodeError, TypeError):
         task_list = [{"prompt": tasks}]
-    
+
+    items_error = validate_parallel_items(task_list, "tasks")
+    if items_error:
+        return {"error": items_error}
+
     # DIRECT EXECUTE: Intercept heavy write tasks - bugs can't echo long content
     CONTENT_THRESHOLD = 300  # chars - below this bugs handle fine
     direct_results = []
@@ -634,8 +733,12 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
         else:
             bug_tasks.append(task)
     
-    # Run remaining tasks through bugs
-    bug_results = run_tool_swarm(bug_tasks, colony.bugs, deep=deep) if bug_tasks else []
+    # Run remaining tasks through bugs, off the event loop. Also
+    # validate the task list: an empty list is an error, not a
+    # no-op swarm, and over-long lists are rejected.
+    if not task_list:
+        return {"error": "tasks must not be empty"}
+    bug_results = await asyncio.to_thread(run_tool_swarm, bug_tasks, colony.bugs, deep) if bug_tasks else []
     results = direct_results + bug_results
 
     
@@ -646,7 +749,7 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     # Synthesize if requested
     synthesis = None
     if synthesize:
-        synthesis = synthesize_swarm_results(results, task_context=f"Tool swarm with {colony_type} colony")
+        synthesis = await asyncio.to_thread(synthesize_swarm_results, results, task_context=f"Tool swarm with {colony_type} colony")
     
     return {
         "colony_id": colony.id,
@@ -687,7 +790,7 @@ async def system_health_swarm(synthesize: bool = True) -> dict:
         {"prompt": "Check disk usage and report if any partition is above 80% full."},
     ]
     
-    results = run_tool_swarm(tasks, bugs)
+    results = await asyncio.to_thread(run_tool_swarm, tasks, bugs)
     elapsed = time.time() - start
     
     # Summarize health
@@ -699,7 +802,7 @@ async def system_health_swarm(synthesize: bool = True) -> dict:
     # Synthesize if requested
     synthesis = None
     if synthesize:
-        synthesis = synthesize_swarm_results(results, task_context="System health check")
+        synthesis = await asyncio.to_thread(synthesize_swarm_results, results, task_context="System health check")
     
     return {
         "verdict": "healthy" if not issues else "issues_found",
@@ -745,13 +848,13 @@ async def recon_swarm(target_path: str, deep: bool = False, synthesize: bool = T
         {"prompt": f"Use exec_cmd to run 'cat {target_path}/README.md 2>/dev/null || cat {target_path}/README 2>/dev/null || echo No README found' and summarize."},
     ]
     
-    results = run_tool_swarm(tasks, bugs, deep=deep)
+    results = await asyncio.to_thread(run_tool_swarm, tasks, bugs, deep)
     elapsed = time.time() - start
     
     # Synthesize if requested
     synthesis = None
     if synthesize:
-        synthesis = synthesize_swarm_results(results, task_context=f"Reconnaissance of {target_path}")
+        synthesis = await asyncio.to_thread(synthesize_swarm_results, results, task_context=f"Reconnaissance of {target_path}")
     
     return {
         "target": target_path,
@@ -774,12 +877,13 @@ async def worker_task(task: str, context: str = "") -> dict:
     from .agent import run_tool_agent
     start = time.time()
     
-    result = run_tool_agent(
+    result = await asyncio.to_thread(
+        run_tool_agent,
         role="worker",
         model=MODEL_TIERS["worker"],
         task=task,
         context=context,
-        deep=True  # Workers always use deep mode for complex tasks
+        deep=True,  # Workers always use deep mode for complex tasks
     )
     
     elapsed = time.time() - start
@@ -881,7 +985,7 @@ async def deep_analysis_swarm(target_path: str, analysis_type: str = "full", syn
             {"prompt": f"Identify potential cleanup targets: old venvs, caches, temp files. Use exec_cmd to find and size them."},
         ]
     
-    results = run_tool_swarm(tasks, bugs, deep=True)
+    results = await asyncio.to_thread(run_tool_swarm, tasks, bugs, True)
     elapsed = time.time() - start
     
     # Extract findings summary
@@ -893,7 +997,7 @@ async def deep_analysis_swarm(target_path: str, analysis_type: str = "full", syn
     # Synthesize if requested
     synthesis = None
     if synthesize:
-        synthesis = synthesize_swarm_results(results, task_context=f"Deep {analysis_type} analysis of {target_path}")
+        synthesis = await asyncio.to_thread(synthesize_swarm_results, results, task_context=f"Deep {analysis_type} analysis of {target_path}")
     
     return {
         "target": target_path,
@@ -924,7 +1028,7 @@ async def synthesize(results: str, context: str = "") -> dict:
     except json.JSONDecodeError:
         return {"error": "Invalid JSON for results"}
     
-    synthesis = synthesize_swarm_results(result_list, task_context=context)
+    synthesis = await asyncio.to_thread(synthesize_swarm_results, result_list, task_context=context)
     elapsed = time.time() - start
     
     return {
