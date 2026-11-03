@@ -204,6 +204,23 @@ def test_validate_python_code_empty_and_failed_fragment():
     assert result["validated"] is False
 
 
+def test_validate_python_code_worker_error_marker_is_not_validated():
+    # Real case from a CPU run (2026-11-03): a worker returned the
+    # literal text "Error: timed out" instead of a function, spliced
+    # in before the first function. It must not validate, even when
+    # the marker lands in a comment and the file still parses.
+    assert validate_python_code(
+        "# Error: timed out\ndef f():\n    return 1\n"
+    )["validated"] is False
+    assert validate_python_code(
+        '"""\nSpec\n"""\n\nError: timed out\n\ndef f():\n    return 1\n'
+    )["validated"] is False
+    # But a docstring that merely mentions an error is not a failure.
+    assert validate_python_code(
+        'def f():\n    """Raises Error: on bad input."""\n    return 1\n'
+    )["validated"] is True
+
+
 # ---------- chunked_code_gen: written vs validated ----------
 
 def _mock_code_gen(monkeypatch, worker_bodies):
