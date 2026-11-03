@@ -381,3 +381,88 @@ def validate_python_code(content: str) -> Dict[str, Any]:
         "function_names": function_names,
         "function_count": len(function_names),
     }
+
+
+def _is_failed_fragment(text: str) -> bool:
+    """True if a generated chunk is a failure marker, not content."""
+    if not isinstance(text, str):
+        return True
+    stripped = text.strip()
+    return (
+        not stripped
+        or stripped.startswith("[Section ")
+        and "generation failed" in stripped
+        or stripped.startswith("# Function ")
+        and "generation failed" in stripped
+    )
+
+
+def validate_document_sections(planned_titles, contents) -> Dict[str, Any]:
+    """Validate a chunked_write result without running or judging it.
+
+    Checks only structural completion: the planned number of sections
+    were generated, none are empty, and none are failure markers.
+    This does NOT judge quality, accuracy, or whether the content
+    matches the spec -- a validated document is complete, not correct.
+    """
+    errors = []
+    warnings = []
+    planned = len(planned_titles or [])
+    generated = len(contents or [])
+    if generated != planned:
+        errors.append(f"Expected {planned} sections, got {generated}")
+    empty = 0
+    failed = 0
+    for idx, content in enumerate(contents or []):
+        if not isinstance(content, str) or not content.strip():
+            empty += 1
+            errors.append(f"Section {idx + 1} is empty")
+        elif _is_failed_fragment(content):
+            failed += 1
+            errors.append(f"Section {idx + 1} generation failed")
+        elif len(content.strip()) < 20:
+            warnings.append(f"Section {idx + 1} is very short ({len(content.strip())} chars)")
+    return {
+        "validated": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "sections_planned": planned,
+        "sections_generated": generated,
+        "sections_empty": empty,
+        "sections_failed": failed,
+    }
+
+
+def validate_analyses(planned_count: int, analyses) -> Dict[str, Any]:
+    """Validate a chunked_analysis result, structurally only.
+
+    Checks the planned number of perspectives were returned, none are
+    empty, and none are the 'Error' placeholder. Like document
+    validation, this does NOT judge quality or correctness.
+    """
+    errors = []
+    warnings = []
+    analyses = analyses or []
+    if len(analyses) != planned_count:
+        errors.append(f"Expected {planned_count} perspectives, got {len(analyses)}")
+    empty = 0
+    failed = 0
+    for idx, item in enumerate(analyses):
+        text = item.get("analysis", "") if isinstance(item, dict) else ""
+        if item.get("perspective") == "Error" if isinstance(item, dict) else False:
+            failed += 1
+            errors.append(f"Perspective {idx + 1} analysis failed")
+        elif not isinstance(text, str) or not text.strip():
+            empty += 1
+            errors.append(f"Perspective {idx + 1} analysis is empty")
+        elif len(text.strip()) < 20:
+            warnings.append(f"Perspective {idx + 1} analysis is very short")
+    return {
+        "validated": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "perspectives_planned": planned_count,
+        "perspectives_generated": len(analyses),
+        "perspectives_empty": empty,
+        "perspectives_failed": failed,
+    }

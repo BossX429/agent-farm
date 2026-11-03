@@ -190,9 +190,47 @@ async def quick_colony() -> dict:
     }
 
 
+def _action_log_summary() -> dict:
+    """Observability summary for the opt-in action log (Copilot #4).
+
+    Returns only counts and the last action/outcome -- never log
+    content, which action_log already redacts. If logging is off,
+    this reports enabled=False with no records, rather than failing.
+    """
+    try:
+        from .action_log import _log_path
+    except Exception:
+        return {"enabled": False, "records": 0, "last_action": None, "last_outcome": None}
+    path = _log_path()
+    if not path:
+        return {"enabled": False, "records": 0, "last_action": None, "last_outcome": None}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [ln for ln in f if ln.strip()]
+    except FileNotFoundError:
+        return {"enabled": True, "records": 0, "last_action": None, "last_outcome": None}
+    except Exception:
+        return {"enabled": True, "records": 0, "last_action": None, "last_outcome": None}
+    last = None
+    if lines:
+        try:
+            last = json.loads(lines[-1])
+        except Exception:
+            last = None
+    return {
+        "enabled": True,
+        "records": len(lines),
+        "last_action": last.get("action") if last else None,
+        "last_outcome": last.get("outcome") if last else None,
+        "last_ts": last.get("ts") if last else None,
+    }
+
+
 @mcp.tool()
 async def farm_stats() -> dict:
     """Get comprehensive farm statistics"""
+    from .metrics import get_metrics
+
     return {
         "colonies_spawned": stats["colonies_spawned"],
         "active_colonies": len(colonies),
@@ -200,7 +238,17 @@ async def farm_stats() -> dict:
         "discoveries": stats["discoveries"],
         "swarm_runs": stats["swarm_runs"],
         # No speedup field: none is measured (see stats note above).
-        "model_tiers": MODEL_TIERS
+        # No token-cost field: Ollama responses here do not report
+        # token counts uniformly, so a cost number would be invented.
+        "model_tiers": MODEL_TIERS,
+        # Copilot roadmap #3 (metrics) and #4 (observability):
+        # per-tool counts/durations/validation outcomes, plus the
+        # action-log summary. Metrics cover chunked tools in this
+        # change; other swarms can record_tool_run() to appear here.
+        "metrics": get_metrics(),
+        "observability": {
+            "action_log": _action_log_summary(),
+        },
     }
 
 
