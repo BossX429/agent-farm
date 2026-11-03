@@ -1,0 +1,909 @@
+"""MCP tools that run swarms: code, file, exec, api, kmkb, and others."""
+
+import os
+import uuid
+import json
+import httpx
+import asyncio
+from datetime import datetime
+from typing import Optional, Dict, List, Any
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from .mcp_app import mcp
+from .state import MODEL_TIERS, OLLAMA_URL, colonies, stats
+from .colony import (
+    _unique_id,
+    create_bug,
+    spawn_colony_internal,
+    execute_parallel_swarm,
+    entangle_colony,
+)
+from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
+
+
+
+@mcp.tool()
+async def code_review_swarm(code: str, filepath: str = "") -> dict:
+    """
+    Run parallel code review with 4 specialized perspectives.
+    Pass code directly OR filepath to read from disk.
+    Returns: security, performance, style, and refactoring analysis.
+    """
+    import time
+    start = time.time()
+    
+    # Read from file if filepath provided
+    if filepath and not code:
+        try:
+            with open(filepath, 'r') as f:
+                code = f.read()
+        except Exception as e:
+            return {"error": f"Failed to read {filepath}: {str(e)}"}
+    
+    if not code:
+        return {"error": "No code provided. Pass code or filepath."}
+    
+    # Truncate if too long (keep first 500 lines max)
+    lines = code.split('\n')
+    if len(lines) > 500:
+        code = '\n'.join(lines[:500])
+        truncated = True
+    else:
+        truncated = False
+    
+    # Use the synthesizer tier, not a hardcoded model outside MODEL_TIERS.
+    # A model outside MODEL_TIERS was previously hardcoded here even though it is not a
+    # documented tier, so reviews would fail or pull an unexpected model
+    # on installs that only have the documented 4b + 14b models.
+    model = MODEL_TIERS["synthesizer"]
+    
+    # Build explicit prompts with code embedded directly
+    prompts = {
+        "security": f"""You are a senior security engineer. Analyze the following code for security vulnerabilities.
+
+RULES:
+- You MUST analyze the EXACT code provided below
+- List EVERY security issue you find
+- Format: [SEVERITY] Issue description (line number if possible)
+- Severities: CRITICAL, HIGH, MEDIUM, LOW
+- If you find no issues, say "No security issues found"
+- Do NOT give generic advice - only issues in THIS code
+
+CODE TO ANALYZE:
+```
+{code}
+```
+
+SECURITY ISSUES FOUND:""",
+
+        "performance": f"""You are a performance optimization expert. Analyze the following code for performance problems.
+
+RULES:
+- You MUST analyze the EXACT code provided below
+- List EVERY performance issue you find
+- Format: [IMPACT] Issue description -> Fix
+- Impacts: HIGH, MEDIUM, LOW
+- If you find no issues, say "No performance issues found"
+- Do NOT give generic advice - only issues in THIS code
+
+CODE TO ANALYZE:
+```
+{code}
+```
+
+PERFORMANCE ISSUES FOUND:""",
+
+        "style": f"""You are a code quality reviewer. Analyze the following code for style and readability issues.
+
+RULES:
+- You MUST analyze the EXACT code provided below
+- List EVERY style/readability issue you find
+- Format: Issue description -> Recommendation
+- Consider: naming, formatting, comments, structure, PEP8
+- If you find no issues, say "No style issues found"
+- Do NOT give generic advice - only issues in THIS code
+
+CODE TO ANALYZE:
+```
+{code}
+```
+
+STYLE ISSUES FOUND:""",
+
+        "refactoring": f"""You are a senior software architect. Suggest refactoring opportunities for the following code.
+
+RULES:
+- You MUST analyze the EXACT code provided below
+- List concrete refactoring suggestions
+- Format: [PRIORITY] What to refactor -> How to improve it
+- Priorities: HIGH, MEDIUM, LOW
+- Include brief code snippets for complex suggestions
+- If code is already clean, say "No major refactoring needed"
+- Do NOT give generic advice - only suggestions for THIS code
+
+CODE TO ANALYZE:
+```
+{code}
+```
+
+REFACTORING SUGGESTIONS:"""
+    }
+    
+    # Execute all 4 reviews in parallel using ThreadPoolExecutor
+    results = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(sync_query_raw, model, prompt): review_type
+            for review_type, prompt in prompts.items()
+        }
+        for future in as_completed(futures):
+            review_type = futures[future]
+            try:
+                results[review_type] = future.result()
+            except Exception as e:
+                results[review_type] = f"Error: {str(e)}"
+    
+    elapsed = time.time() - start
+    
+    return {
+        "filepath": filepath or "(direct input)",
+        "lines_of_code": len(lines),
+        "truncated": truncated,
+        "model": model,
+        "review": results,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+# ============ EXECUTION SWARMS ============
+
+@mcp.tool()
+async def code_gen_swarm(spec: str, language: str = "python") -> dict:
+    """
+    Generate code from spec with 4 parallel perspectives.
+    Returns: main code, tests, docstring, usage examples.
+    """
+    import time
+    start = time.time()
+    # See code_review_swarm: use the documented synthesizer tier.
+    model = MODEL_TIERS["synthesizer"]
+
+    prompts = {
+        "code": f"""You are an expert {language} developer. Generate clean, production-ready code.
+
+SPECIFICATION:
+{spec}
+
+RULES:
+- Write complete, working {language} code
+- Include error handling
+- Use best practices
+- Add inline comments for complex logic
+- Output ONLY the code, no explanations
+
+CODE:""",
+
+        "tests": f"""You are a test engineer. Generate comprehensive tests for this specification.
+
+SPECIFICATION:
+{spec}
+
+RULES:
+- Write complete test cases in {language}
+- Cover edge cases and error conditions
+- Use appropriate testing framework (pytest for Python)
+- Output ONLY the test code, no explanations
+
+TESTS:""",
+
+        "docs": f"""You are a technical writer. Generate documentation for this specification.
+
+SPECIFICATION:
+{spec}
+
+RULES:
+- Write a clear docstring/documentation
+- Include parameters, return values, exceptions
+- Add usage examples in the docstring
+- Output ONLY the documentation, no explanations
+
+DOCUMENTATION:""",
+
+        "examples": f"""You are a developer advocate. Generate usage examples for this specification.
+
+SPECIFICATION:
+{spec}
+
+RULES:
+- Write 3-5 practical usage examples
+- Show different use cases
+- Include comments explaining each example
+- Output ONLY the example code, no explanations
+
+EXAMPLES:"""
+    }
+    
+    results = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(sync_query_raw, model, prompt): gen_type
+            for gen_type, prompt in prompts.items()
+        }
+        for future in as_completed(futures):
+            gen_type = futures[future]
+            try:
+                results[gen_type] = future.result()
+            except Exception as e:
+                results[gen_type] = f"Error: {str(e)}"
+    
+    elapsed = time.time() - start
+    return {
+        "spec": spec[:100] + "..." if len(spec) > 100 else spec,
+        "language": language,
+        "generated": results,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+@mcp.tool()
+async def file_swarm(operations: str) -> dict:
+    """
+    Execute parallel file operations.
+    operations: JSON array of {action, path, content?}
+    Actions: read, write, append, exists, delete
+    Example: [{"action": "write", "path": "/tmp/test.txt", "content": "hello"}]
+    """
+    import time
+    start = time.time()
+    
+    try:
+        ops = json.loads(operations)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON for operations"}
+    
+    def execute_file_op(op: dict) -> dict:
+        action = op.get("action", "")
+        raw_path = op.get("path", "")
+        content = op.get("content", "")
+
+        # Safety: canonical (symlink-resolved) path checks, not raw
+        # startswith(). The old check blocked "/etc" etc. as prefixes but
+        # allowed everything else -- including home, repos, and Documents --
+        # for read/write/append/delete, and a symlink in an allowed spot
+        # pointing at a blocked spot passed it. Blocked entries are matched
+        # as whole directories/files via commonpath(); everything under
+        # the user's home that is not explicitly blocked is still reachable
+        # here by design for a local tool, but sensitive system paths are
+        # not, and neither are symlinks that resolve into them.
+        # NOTE: this is still not a sandbox -- see the exec_cmd note in
+        # tools.py. Run locally with trusted prompts only.
+        import os as _os
+
+        def _is_within(_path: str, _directory: str) -> bool:
+            try:
+                return _os.path.commonpath([_path, _directory]) == _directory
+            except ValueError:
+                return False
+
+        expanded = _os.path.expanduser(_os.path.expandvars(raw_path)) if raw_path else ""
+        path = _os.path.realpath(expanded) if expanded else ""
+        dangerous = ["/etc", "/usr", "/bin", "/sbin", "/boot", "/root",
+                     "/sys", "/proc", "/etc/shadow", "/etc/passwd",
+                     "/etc/gshadow", "/etc/sudoers"]
+        if path and any(
+            path == _os.path.realpath(d) or _is_within(path, _os.path.realpath(d))
+            for d in dangerous
+        ):
+            return {"action": action, "path": raw_path, "error": "Dangerous path blocked"}
+
+        try:
+            if action == "read":
+                with open(path, 'r') as f:
+                    # Bound reads: the old version read the whole file with
+                    # no limit, so one huge file could blow up memory.
+                    return {"action": action, "path": raw_path,
+                            "content": f.read(100000), "status": "success"}
+            elif action == "write":
+                with open(path, 'w') as f:
+                    f.write(content)
+                return {"action": action, "path": raw_path, "bytes": len(content), "status": "success"}
+            elif action == "append":
+                with open(path, 'a') as f:
+                    f.write(content)
+                return {"action": action, "path": raw_path, "bytes": len(content), "status": "success"}
+            elif action == "exists":
+                return {"action": action, "path": raw_path, "exists": _os.path.exists(path), "status": "success"}
+            elif action == "delete":
+                _os.remove(path)
+                return {"action": action, "path": raw_path, "status": "success"}
+            else:
+                return {"action": action, "path": raw_path, "error": f"Unknown action: {action}"}
+        except Exception as e:
+            return {"action": action, "path": raw_path, "error": str(e)}
+
+    # Cap workers like exec_swarm (8): the old max_workers=len(ops) let a
+    # huge operation list spike threads. Results are returned in input
+    # order (not as_completed order), so callers can match results to ops.
+    results = [None] * len(ops)
+    with ThreadPoolExecutor(max_workers=max(1, min(len(ops), 8))) as executor:
+        futures = {executor.submit(execute_file_op, op): i for i, op in enumerate(ops)}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    
+    elapsed = time.time() - start
+    return {
+        "operations": len(ops),
+        "results": results,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+@mcp.tool()
+async def exec_swarm(commands: str) -> dict:
+    """
+    Execute shell commands in parallel (with safety checks).
+    commands: JSON array of command strings
+    Example: ["ls -la", "pwd", "whoami"]
+    BLOCKED: rm -rf, sudo, dd, mkfs, chmod 777, pipe-to-shell, etc.
+    NOTE: blocklist only, not a sandbox -- local trusted use only.
+
+    This previously kept its own older blocklist and always used
+    shell=True, bypassing the hardening in tools.tool_exec_cmd
+    (shell-free simple commands, multi-line and substitution blocks).
+    It now delegates to tools.tool_exec_cmd for every command, so both
+    paths enforce exactly the same rules.
+    """
+    import time
+    from .tools import tool_exec_cmd
+    start = time.time()
+
+    try:
+        cmds = json.loads(commands)
+    except json.JSONDecodeError:
+        cmds = [commands]  # Single command
+
+    def execute_cmd(cmd: str) -> dict:
+        result = tool_exec_cmd(cmd)
+        if "error" in result:
+            return {
+                "command": cmd,
+                "error": result["error"],
+                "status": "blocked" if result["error"].startswith("Blocked") else "error",
+            }
+        return {
+            "command": cmd,
+            "stdout": (result.get("stdout") or "")[:2000],
+            "stderr": (result.get("stderr") or "")[:500],
+            "returncode": result.get("returncode"),
+            "status": "success" if result.get("returncode") == 0 else "failed",
+        }
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=min(len(cmds), 8)) as executor:
+        futures = [executor.submit(execute_cmd, cmd) for cmd in cmds]
+        for future in as_completed(futures):
+            results.append(future.result())
+    
+    elapsed = time.time() - start
+    return {
+        "commands": len(cmds),
+        "results": results,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+@mcp.tool()
+async def api_swarm(requests: str) -> dict:
+    """
+    Execute parallel HTTP API requests.
+    requests: JSON array of {url, method?, headers?, body?}
+    Example: [{"url": "https://api.example.com/data"}, {"url": "...", "method": "POST", "body": "{}"}]
+
+    This previously called httpx directly with no URL validation,
+    bypassing the SSRF guard in tools.http_get/http_post. It now
+    delegates to tools._http_request for every request, so public-URL
+    only, redirect re-validation, and method checks apply here too.
+    """
+    import time
+    from .tools import _http_request
+    start = time.time()
+
+    try:
+        reqs = json.loads(requests)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON for requests"}
+
+    def execute_request(req: dict) -> dict:
+        url = req.get("url", "")
+        method = req.get("method", "GET").upper()
+        headers = req.get("headers", {}) or {}
+        body = req.get("body") or ""
+        result = _http_request(method, url, body=body, headers=headers)
+        if "error" in result:
+            return {
+                "url": url,
+                "method": method,
+                "error": result["error"],
+                "status": "blocked" if "Blocked" in result["error"] else "failed",
+            }
+        return {
+            "url": url,
+            "method": method,
+            "status_code": result.get("status"),
+            "body": (result.get("body") or "")[:2000],
+            "status": "success",
+        }
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=min(len(reqs), 10)) as executor:
+        futures = [executor.submit(execute_request, req) for req in reqs]
+        for future in as_completed(futures):
+            results.append(future.result())
+    
+    elapsed = time.time() - start
+    return {
+        "requests": len(reqs),
+        "results": results,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+@mcp.tool()
+async def kmkb_swarm(queries: str, synthesize: bool = True) -> dict:
+    """
+    Query KMKB from multiple angles in parallel, optionally synthesize.
+    queries: JSON array of query strings OR single topic to auto-expand
+    Example: ["what is X?", "how does X work?", "examples of X"]
+    Or just: "Agent Farm" (auto-expands to multiple queries)
+    """
+    import time
+    start = time.time()
+    
+    KMKB_URL = "http://localhost:11434"  # Ollama for synthesis
+    
+    try:
+        q_list = json.loads(queries)
+    except (json.JSONDecodeError, TypeError):
+        # Auto-expand single topic into multiple queries
+        topic = queries
+        q_list = [
+            f"What is {topic}?",
+            f"How does {topic} work?",
+            f"What are the key features of {topic}?",
+            f"What problems does {topic} solve?",
+            f"How do I use {topic}?"
+        ]
+    
+    def query_kmkb(query: str) -> dict:
+        """Query KMKB via its search endpoint"""
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                # Try KMKB's ask endpoint on the default port
+                resp = client.post(
+                    "http://127.0.0.1:8765/ask",
+                    json={"question": query, "top_k": 3},
+                    timeout=30.0
+                )
+                if resp.status_code == 200:
+                    return {"query": query, "result": resp.json(), "status": "success"}
+        except:
+            pass
+        
+        # Fallback: use Ollama with the query directly
+        try:
+            with httpx.Client() as client:
+                resp = client.post(
+                    f"{KMKB_URL}/api/generate",
+                    json={"model": MODEL_TIERS["worker"], "prompt": query, "stream": False},
+                    timeout=60.0
+                )
+                if resp.status_code == 200:
+                    return {"query": query, "result": resp.json().get("response", ""), "status": "ollama_fallback"}
+        except Exception as e:
+            return {"query": query, "error": str(e), "status": "failed"}
+        
+        return {"query": query, "error": "No response", "status": "failed"}
+    
+    results = []
+    # Cap workers at 8 like exec_swarm/file_swarm: the old
+    # max_workers=len(q_list) let a long query list spike threads.
+    with ThreadPoolExecutor(max_workers=max(1, min(len(q_list), 8))) as executor:
+        futures = [executor.submit(query_kmkb, q) for q in q_list]
+        for future in as_completed(futures):
+            results.append(future.result())
+    
+    # Synthesize if requested
+    synthesis = None
+    if synthesize and len(results) > 1:
+        combined = "\n\n".join([
+            f"Q: {r['query']}\nA: {r.get('result', r.get('error', 'No result'))}"
+            for r in results
+        ])
+        synth_prompt = f"""Synthesize these research findings into a coherent summary:
+
+{combined}
+
+SYNTHESIS (be concise, extract key insights):"""
+        
+        synthesis = sync_query_raw(MODEL_TIERS["synthesizer"], synth_prompt)
+    
+    elapsed = time.time() - start
+    return {
+        "queries": len(q_list),
+        "results": results,
+        "synthesis": synthesis,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+# ============ TOOL-ENABLED AGENTS ============
+
+@mcp.tool()
+async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False, synthesize: bool = False) -> dict:
+    """
+    Deploy tool-enabled agents that can use real system tools.
+    Each bug role has different tool permissions:
+    - scout: read_file, list_dir, file_exists, system_status, process_list
+    - worker: read_file, write_file, exec_cmd, http_get, http_post
+    - memory: read_file, kmkb_search, kmkb_ask, list_dir
+    - guardian: system_status, process_list, disk_usage, check_service
+    - learner: read_file, analyze_code, list_dir, kmkb_search
+    
+    tasks: JSON array of task objects:
+      Standard: {"prompt": "Do something"}
+      Write:    {"path": "/file.txt", "content": "data..."}  <-- DIRECT EXECUTE for long content
+    
+    Example: [{"prompt": "Check system health"}, {"path": "/tmp/out.txt", "content": "results"}]
+    
+    DIRECT EXECUTE: Write tasks with content >300 chars bypass LLM entirely.
+    Bugs can't reliably echo long content - we write directly instead.
+    
+    deep: Enable deep work mode - bugs chain multiple tool calls for complex tasks
+    synthesize: If True, uses qwen2.5:14b to synthesize results into unified summary
+    """
+    import time
+    from .agent import run_tool_swarm
+    from .tools import execute_tool
+    start = time.time()
+    
+    # Spawn colony
+    colony = spawn_colony_internal(colony_type)
+    
+    # Parse tasks
+    try:
+        task_list = json.loads(tasks)
+    except (json.JSONDecodeError, TypeError):
+        task_list = [{"prompt": tasks}]
+    
+    # DIRECT EXECUTE: Intercept heavy write tasks - bugs can't echo long content
+    CONTENT_THRESHOLD = 300  # chars - below this bugs handle fine
+    direct_results = []
+    bug_tasks = []
+    
+    for task in task_list:
+        prompt = task.get("prompt", "")
+        content = task.get("content", "")
+        path = task.get("path", "")
+        
+        # Check if this is a write task with long content
+        is_write_task = content and path
+        is_heavy = len(content) > CONTENT_THRESHOLD
+        
+        if is_write_task and is_heavy:
+            # Direct execute - skip the LLM entirely
+            result = execute_tool("write_file", "worker", path=path, content=content)
+            direct_results.append({
+                "bug_id": "direct-execute",
+                "role": "worker",
+                "model": "none",
+                "task": f"write_file({path})",
+                "answer": f"Wrote {len(content)} chars to {path}" if "error" not in result else result.get("error"),
+                "tool_calls": 1,
+                "iterations": 1,
+                "status": "completed" if "error" not in result else "failed",
+                "direct_execute": True
+            })
+        else:
+            bug_tasks.append(task)
+    
+    # Run remaining tasks through bugs
+    bug_results = run_tool_swarm(bug_tasks, colony.bugs, deep=deep) if bug_tasks else []
+    results = direct_results + bug_results
+
+    
+    elapsed = time.time() - start
+    colony.tasks_completed += len(task_list)
+    stats["tasks_executed"] += len(task_list)
+    
+    # Synthesize if requested
+    synthesis = None
+    if synthesize:
+        synthesis = synthesize_swarm_results(results, task_context=f"Tool swarm with {colony_type} colony")
+    
+    return {
+        "colony_id": colony.id,
+        "colony_type": colony_type,
+        "tasks": len(task_list),
+        "deep_mode": deep,
+        "results": results,
+        "synthesis": synthesis,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+@mcp.tool()
+async def system_health_swarm(synthesize: bool = True) -> dict:
+    """
+    Quick system health check using tool-enabled bugs.
+    Deploys guardian bugs to check CPU, memory, disk, and services.
+    
+    synthesize: If True (default), uses qwen2.5:14b to synthesize results into unified summary
+    """
+    import time
+    from .agent import run_tool_swarm
+    start = time.time()
+    
+    # Spawn guardian colony
+    colony_id = _unique_id("health")
+    bugs = [
+        create_bug(colony_id, "guardian"),
+        create_bug(colony_id, "guardian"),
+        create_bug(colony_id, "guardian"),
+        create_bug(colony_id, "guardian"),
+    ]
+    
+    tasks = [
+        {"prompt": "Check overall system status (CPU, memory, disk) and report if anything is concerning."},
+        {"prompt": "List the top processes using the most CPU. Report any that seem unusual."},
+        {"prompt": "Check if ollama service is running and healthy."},
+        {"prompt": "Check disk usage and report if any partition is above 80% full."},
+    ]
+    
+    results = run_tool_swarm(tasks, bugs)
+    elapsed = time.time() - start
+    
+    # Summarize health
+    issues = []
+    for r in results:
+        if "error" in r.get("answer", "").lower() or "warning" in r.get("answer", "").lower():
+            issues.append(r.get("answer", ""))
+    
+    # Synthesize if requested
+    synthesis = None
+    if synthesize:
+        synthesis = synthesize_swarm_results(results, task_context="System health check")
+    
+    return {
+        "verdict": "healthy" if not issues else "issues_found",
+        "issues": issues,
+        "checks": results,
+        "synthesis": synthesis,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+@mcp.tool()
+async def recon_swarm(target_path: str, deep: bool = False, synthesize: bool = True) -> dict:
+    """
+    Reconnaissance swarm - scouts explore a directory/codebase.
+    Uses scout bugs with read-only tools to map out a target.
+    
+    target_path: Directory to explore
+    deep: Enable deep work mode (default False) - multi-iteration for complex analysis
+    synthesize: If True (default), uses qwen2.5:14b to synthesize findings into unified report
+    """
+    import time
+    from .agent import run_tool_swarm
+    start = time.time()
+    
+    # Expand ~ to home directory
+    if target_path.startswith("~"):
+        target_path = os.path.expanduser(target_path)
+    
+    colony_id = _unique_id("recon")
+    
+    # All scouts with exec_cmd for recon (they have it now)
+    bugs = [
+        create_bug(colony_id, "scout"),
+        create_bug(colony_id, "scout"),
+        create_bug(colony_id, "scout"),
+        create_bug(colony_id, "scout"),
+    ]
+    
+    tasks = [
+        {"prompt": f"List the contents of {target_path} using list_dir. Report what type of project this is."},
+        {"prompt": f"Use exec_cmd to run 'du -sh {target_path}/*' and report the sizes of each item."},
+        {"prompt": f"Use exec_cmd to run 'find {target_path} -maxdepth 2 -name \"*.py\" -o -name \"*.toml\" -o -name \"*.json\" | head -20' and list what config/code files exist."},
+        {"prompt": f"Use exec_cmd to run 'cat {target_path}/README.md 2>/dev/null || cat {target_path}/README 2>/dev/null || echo No README found' and summarize."},
+    ]
+    
+    results = run_tool_swarm(tasks, bugs, deep=deep)
+    elapsed = time.time() - start
+    
+    # Synthesize if requested
+    synthesis = None
+    if synthesize:
+        synthesis = synthesize_swarm_results(results, task_context=f"Reconnaissance of {target_path}")
+    
+    return {
+        "target": target_path,
+        "findings": results,
+        "synthesis": synthesis,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+@mcp.tool()
+async def worker_task(task: str, context: str = "") -> dict:
+    """
+    Single worker bug with tools to complete a task.
+    Worker has: read_file, write_file, exec_cmd, http_get, http_post
+    
+    task: What to do
+    context: Optional context/background
+    """
+    import time
+    from .agent import run_tool_agent
+    start = time.time()
+    
+    result = run_tool_agent(
+        role="worker",
+        model=MODEL_TIERS["worker"],
+        task=task,
+        context=context,
+        deep=True  # Workers always use deep mode for complex tasks
+    )
+    
+    elapsed = time.time() - start
+    
+    return {
+        "task": task[:100],
+        "answer": result["answer"],
+        "tool_calls": result["tool_calls"],
+        "iterations": result["iterations"],
+        "status": result["status"],
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+@mcp.tool()
+async def heavy_write(path: str, content: str) -> dict:
+    """
+    Direct file write - NO LLM involved. Use for large content.
+    
+    Bugs can't reliably echo content >300 chars through the LLM.
+    This tool writes directly to disk, bypassing the model entirely.
+    
+    path: File path to write to
+    content: Content to write (any length)
+    
+    Returns: success/error status and bytes written
+    """
+    from .tools import execute_tool
+    
+    result = execute_tool("write_file", "worker", path=path, content=content)
+    
+    if "error" in result:
+        return {
+            "status": "failed",
+            "error": result["error"],
+            "path": path
+        }
+    
+    return {
+        "status": "completed",
+        "path": path,
+        "bytes_written": result.get("bytes_written", len(content)),
+        "direct_execute": True
+    }
+
+
+@mcp.tool()
+async def deep_analysis_swarm(target_path: str, analysis_type: str = "full", synthesize: bool = True) -> dict:
+    """
+    Deep analysis swarm using WORKERS with exec_cmd for thorough system analysis.
+    Workers can run shell commands (find, du, grep, etc.) for real analysis.
+    
+    target_path: Directory/path to analyze
+    analysis_type: 'full', 'redundant', 'sizes', 'cleanup'
+    synthesize: If True (default), uses qwen2.5:14b to synthesize findings
+    
+    Use this for finding: redundant files, cache sizes, disk usage, log files, etc.
+    """
+    import time
+    from .agent import run_tool_swarm
+    start = time.time()
+    
+    colony_id = _unique_id("deep")
+    
+    # Workers have exec_cmd - essential for deep analysis
+    bugs = [
+        create_bug(colony_id, "worker"),
+        create_bug(colony_id, "worker"),
+        create_bug(colony_id, "worker"),
+        create_bug(colony_id, "worker"),
+    ]
+    
+    if analysis_type == "redundant":
+        tasks = [
+            {"prompt": f"Find all __pycache__ directories under {target_path} and calculate total size. Use: exec_cmd(find {target_path} -name '__pycache__' -type d -exec du -sh {{}} \\;)"},
+            {"prompt": f"Find all .venv or venv directories under {target_path} and report their sizes. Use exec_cmd with find and du."},
+            {"prompt": f"Find duplicate or redundant files. Check for: .pyc files, .log files over 1MB, temp files. Use exec_cmd with find."},
+            {"prompt": f"Look for old/stale files not accessed in 30+ days under {target_path}. Use: exec_cmd(find {target_path} -atime +30 -type f | head -20)"},
+        ]
+    elif analysis_type == "sizes":
+        tasks = [
+            {"prompt": f"Get disk usage breakdown for {target_path}. Use: exec_cmd(du -sh {target_path}/*) to show each subdirectory size."},
+            {"prompt": f"Find the 10 largest files under {target_path}. Use: exec_cmd(find {target_path} -type f -exec du -h {{}} + | sort -rh | head -10)"},
+            {"prompt": f"Find all files over 10MB under {target_path}. Use: exec_cmd(find {target_path} -size +10M -type f -exec ls -lh {{}} \\;)"},
+            {"prompt": f"Count total files and directories under {target_path}. Use exec_cmd with find and wc -l."},
+        ]
+    elif analysis_type == "cleanup":
+        tasks = [
+            {"prompt": f"Find all .log files under {target_path} and report sizes. Use: exec_cmd(find {target_path} -name '*.log' -exec du -sh {{}} \\;)"},
+            {"prompt": f"Find cache directories (.cache, __pycache__, node_modules/.cache). Use exec_cmd with find."},
+            {"prompt": f"Check for backup files (*~, *.bak, *.swp). Use: exec_cmd(find {target_path} -name '*~' -o -name '*.bak' -o -name '*.swp')"},
+            {"prompt": f"Find empty directories that could be removed. Use: exec_cmd(find {target_path} -type d -empty)"},
+        ]
+    else:  # full
+        tasks = [
+            {"prompt": f"Get complete disk usage breakdown for {target_path}. Use: exec_cmd(du -sh {target_path}/*) and summarize what's using space."},
+            {"prompt": f"Find all __pycache__ and .pyc files. Calculate total size. Use exec_cmd with find and du."},
+            {"prompt": f"Find all log files over 1MB. Use: exec_cmd(find {target_path} -name '*.log' -size +1M -exec ls -lh {{}} \\;)"},
+            {"prompt": f"Identify potential cleanup targets: old venvs, caches, temp files. Use exec_cmd to find and size them."},
+        ]
+    
+    results = run_tool_swarm(tasks, bugs, deep=True)
+    elapsed = time.time() - start
+    
+    # Extract findings summary
+    findings = []
+    for r in results:
+        if r.get("status") == "completed" and r.get("answer"):
+            findings.append(r["answer"])
+    
+    # Synthesize if requested
+    synthesis = None
+    if synthesize:
+        synthesis = synthesize_swarm_results(results, task_context=f"Deep {analysis_type} analysis of {target_path}")
+    
+    return {
+        "target": target_path,
+        "analysis_type": analysis_type,
+        "findings": results,
+        "summary": findings,
+        "synthesis": synthesis,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
+@mcp.tool()
+async def synthesize(results: str, context: str = "") -> dict:
+    """
+    Standalone synthesis tool - synthesize any JSON results into unified summary.
+    Uses qwen2.5:14b for accuracy.
+    
+    results: JSON array of result objects (with 'answer' or 'response' keys)
+    context: Optional context about what these results are from
+    
+    Example: synthesize('[{"answer": "CPU at 5%"}, {"answer": "Memory at 20%"}]', "health check")
+    """
+    import time
+    start = time.time()
+    
+    try:
+        result_list = json.loads(results)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON for results"}
+    
+    synthesis = synthesize_swarm_results(result_list, task_context=context)
+    elapsed = time.time() - start
+    
+    return {
+        "input_count": len(result_list),
+        "model": MODEL_TIERS["synthesizer"],
+        "synthesis": synthesis,
+        "elapsed_seconds": round(elapsed, 2)
+    }
+
+
