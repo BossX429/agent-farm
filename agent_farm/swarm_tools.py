@@ -19,6 +19,7 @@ from .colony import (
     entangle_colony,
 )
 from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
+from .action_log import log_action, redact_url
 from .reliability import (
     EXEC_TASK_TIMEOUT_SECONDS,
     FILE_TASK_TIMEOUT_SECONDS,
@@ -328,9 +329,11 @@ async def file_swarm(operations: str) -> dict:
 
         if action in ("read", "exists"):
             if raw_path and not is_swarm_read_allowed(raw_path):
+                log_action("file_blocked", "blocked", f"file_swarm blocked {action}: {raw_path}")
                 return {"action": action, "path": raw_path, "error": "Dangerous path blocked"}
         elif action in ("write", "append", "delete"):
             if raw_path and not is_write_path_allowed(raw_path):
+                log_action("file_blocked", "blocked", f"file_swarm blocked {action}: {raw_path}")
                 return {"action": action, "path": raw_path,
                         "error": "Write only allowed in: /tmp, /home/kyle/repos, /home/kyle/Desktop"}
 
@@ -394,7 +397,7 @@ async def file_swarm(operations: str) -> dict:
 @mcp.tool()
 async def exec_swarm(commands: str) -> dict:
     """
-    Execute shell commands in parallel (with safety checks).
+    Execute commands in parallel (no shell at all; with safety checks).
     commands: JSON array of command strings
     Example: ["ls -la", "pwd", "whoami"]
     BLOCKED: rm -rf, sudo, dd, mkfs, chmod 777, pipe-to-shell, etc.
@@ -507,6 +510,8 @@ async def api_swarm(requests: str, allow_mutating: bool = False) -> dict:
         headers = req.get("headers", {}) or {}
         body = req.get("body") or ""
         if method in ("POST", "PUT", "DELETE") and not allow_mutating:
+            log_action("api_mutating_blocked", "blocked",
+                       f"mutating method blocked: {method} to {redact_url(url)}")
             return {
                 "url": url,
                 "method": method,
@@ -514,6 +519,16 @@ async def api_swarm(requests: str, allow_mutating: bool = False) -> dict:
                          "Pass allow_mutating=true to api_swarm to enable POST/PUT/DELETE.",
                 "status": "blocked",
             }
+        if method in ("POST", "PUT", "DELETE"):
+            # Per-call opt-in only (there is no server-wide flag that
+            # silently enables mutation for later calls), and the
+            # opt-in is visible in the action log when enabled.
+            # Structurally making mutation impossible would break
+            # this tool's intended purpose (calling APIs), so the
+            # safe default + explicit per-call opt-in + logging is
+            # the strongest alternative that keeps the tool usable.
+            log_action("api_mutating_allowed", "allowed",
+                       f"mutating method explicitly allowed: {method} to {redact_url(url)}")
         result = _http_request(method, url, body=body, headers=headers)
         if "error" in result:
             return {
