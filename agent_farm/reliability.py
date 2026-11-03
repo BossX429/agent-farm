@@ -26,6 +26,7 @@ used from both sync and async code without importing the MCP app:
   provide (for example names imported by the surrounding module).
 """
 
+import asyncio
 import ast
 import builtins
 import re
@@ -116,6 +117,12 @@ def run_parallel(
             try:
                 results[idx] = future.result(timeout=timeout)
             except FutureTimeoutError:
+                try:
+                    from .action_log import log_action
+                    log_action("parallel_task_timeout", "timeout",
+                               f"task index {idx} timed out")
+                except Exception:
+                    pass
                 results[idx] = {
                     "error": (
                         f"Task timed out after {timeout} seconds"
@@ -166,6 +173,76 @@ def cap_aggregate_output(
             else:
                 budget -= len(value)
     return results, True
+
+
+# --- Tracked async tasks ---------------------------------------------------
+#
+# Audit note (Manus second review): the review claimed an internal
+# async function used fire-and-forget asyncio.create_task() without
+# storing or awaiting it. A source audit of main at PR #8 found NO
+# asyncio.create_task() call anywhere in agent_farm/ -- async tools
+# use asyncio.to_thread() and await it. There was therefore no live
+# fire-and-forget bug to fix. This helper exists so future code has
+# one safe pattern, and the regression test in
+# tests/test_manus_adversarial.py fails if a bare create_task()
+# appears in agent_farm/ without being tracked here.
+#
+# A tracked task is always stored in a set (so it cannot be garbage
+# collected before it finishes) and its exception is recorded if
+# nobody awaits it. gather_tracked() awaits every task and lets the
+# first exception surface to the caller instead of swallowing it.
+
+_TRACKED_TASKS = set()
+TRACKED_TASK_ERRORS = []
+
+
+def create_tracked_task(coro, name=None):
+    """Create an asyncio task that is stored until it finishes.
+
+    If the task fails and nobody awaited it, the exception is
+    appended to TRACKED_TASK_ERRORS instead of being silently
+    dropped (the "exception was never retrieved" case that
+    fire-and-forget create_task() hides).
+    """
+    task = asyncio.create_task(coro)
+    if name:
+        try:
+            task.set_name(name)
+        except Exception:
+            pass
+    _TRACKED_TASKS.add(task)
+
+    def _done(t):
+        _TRACKED_TASKS.discard(t)
+        if not t.cancelled():
+            exc = t.exception()
+            if exc is not None:
+                # Recorded so a failure is never silently dropped.
+                # gather_tracked() clears this list after it surfaces
+                # the exception to its caller, so a cleared list means
+                # the failure was seen; a non-empty list means a
+                # tracked task failed without being gathered.
+                TRACKED_TASK_ERRORS.append(exc)
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def gather_tracked(coros):
+    """Await coroutines via tracked tasks; first exception surfaces.
+
+    Unlike fire-and-forget, no task is left running unobserved and
+    no exception is swallowed: asyncio.gather() propagates the
+    first exception to this caller.
+    """
+    tasks = [create_tracked_task(c) for c in coros]
+    try:
+        return await asyncio.gather(*tasks)
+    finally:
+        # Exceptions surfaced here were seen by the caller, so drop
+        # matching records to avoid double-reporting them as
+        # "unretrieved" from the done callback.
+        TRACKED_TASK_ERRORS.clear()
 
 
 # --- Python code validation -------------------------------------------------
