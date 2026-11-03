@@ -10,6 +10,7 @@ from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .state import MODEL_TIERS, OLLAMA_URL, GROUNDING
+from .reliability import MODEL_SEMAPHORE
 
 
 async def query_ollama(model: str, prompt: str, grounded: bool = True) -> str:
@@ -30,10 +31,17 @@ async def query_ollama(model: str, prompt: str, grounded: bool = True) -> str:
 
 
 def sync_query_ollama(model: str, prompt: str, grounded: bool = True) -> str:
-    """Synchronous wrapper for parallel execution"""
+    """Synchronous wrapper for parallel execution.
+
+    Model calls are gated by the shared MODEL_SEMAPHORE (see
+    reliability.py), so independent thread pools in different tools
+    cannot each run an unbounded number of simultaneous model
+    requests. This is a queue, not a cancellation: a call waits for
+    a slot instead of starting immediately.
+    """
     full_prompt = f"{GROUNDING}\n\n{prompt}" if grounded else prompt
     try:
-        with httpx.Client() as client:
+        with MODEL_SEMAPHORE, httpx.Client() as client:
             resp = client.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={"model": model, "prompt": full_prompt, "stream": False},
@@ -49,7 +57,7 @@ def sync_query_ollama(model: str, prompt: str, grounded: bool = True) -> str:
 def sync_query_raw(model: str, prompt: str) -> str:
     """Raw query WITHOUT grounding - for deep analysis that needs full thinking"""
     try:
-        with httpx.Client() as client:
+        with MODEL_SEMAPHORE, httpx.Client() as client:
             resp = client.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={"model": model, "prompt": prompt, "stream": False},
@@ -113,7 +121,7 @@ FINDINGS:
 SYNTHESIZED SUMMARY:"""
     
     try:
-        with httpx.Client() as client:
+        with MODEL_SEMAPHORE, httpx.Client() as client:
             resp = client.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={"model": model, "prompt": prompt, "stream": False},
