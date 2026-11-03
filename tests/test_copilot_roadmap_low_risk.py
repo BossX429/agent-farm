@@ -109,6 +109,38 @@ def test_farm_stats_includes_metrics_and_observability():
     reset_metrics()
 
 
+def test_track_tool_run_records_swarm_tool_and_preserves_result():
+    # The decorator must not change what a tool returns, and must
+    # record a run (including an error-keyed dict as a failure).
+    from agent_farm.metrics import track_tool_run
+
+    @track_tool_run("fake_swarm")
+    async def ok_tool():
+        return {"results": [{"a": 1}, {"b": 2}]}
+
+    @track_tool_run("fake_swarm_bad")
+    async def bad_tool():
+        return {"error": "boom"}
+
+    reset_metrics()
+    assert asyncio.run(ok_tool()) == {"results": [{"a": 1}, {"b": 2}]}
+    assert asyncio.run(bad_tool()) == {"error": "boom"}
+    metrics = get_metrics()
+    assert metrics["fake_swarm"]["calls"] == 1
+    assert metrics["fake_swarm"]["successes"] == 1
+    assert metrics["fake_swarm"]["items"] == 2
+    assert metrics["fake_swarm_bad"]["failures"] == 1
+    reset_metrics()
+
+
+def test_farm_stats_states_metrics_coverage():
+    reset_metrics()
+    result = asyncio.run(farm_stats())
+    assert "chunked" in result["metrics_coverage"]
+    assert "read-only" in result["metrics_coverage"]
+    reset_metrics()
+
+
 def test_action_log_summary_off_by_default():
     # With no AGENT_FARM_ACTION_LOG env and no explicit enable, the
     # summary must report disabled, not crash or invent records.
