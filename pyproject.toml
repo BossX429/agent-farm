@@ -16,3 +16,11 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 agent-farm = "agent_farm.server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

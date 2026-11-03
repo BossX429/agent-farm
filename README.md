@@ -26,6 +26,34 @@ LLM-generated shell commands safe against untrusted input. Run it locally,
 with trusted prompts only, and do not expose it to untrusted files, web pages,
 or other users' prompts.
 
+Hardening added in this PR:
+- **HTTP SSRF guard**: `http_get`/`http_post` now allow only public
+  http/https URLs. Private, loopback, link-local, and metadata addresses
+  (including `127.0.0.1` and `169.254.169.254`) are blocked, DNS failures
+  fail closed, and redirects are re-validated hop by hop. For local
+  testing only, `AGENT_FARM_ALLOW_PRIVATE_HTTP=1` or
+  `AGENT_FARM_ALLOWED_HTTP_HOSTS=host1,host2` can relax this. The internal
+  KMKB client (`127.0.0.1:8765`) does not go through these tools.
+- **Shell-free simple commands**: commands with no pipes, redirection,
+  chaining, or substitution now run with `shell=False`, so their arguments
+  cannot be interpreted as shell syntax. Complex shell commands still use
+  `shell=True` after the blocklist, multi-line commands are rejected, and
+  command substitution (`$(...)`, backticks, `${...}`) is blocked.
+- **Tests and CI**: see Testing below. CI runs compile checks and pytest
+  on push and pull requests to `main`.
+
+## Testing
+
+```bash
+pip install .[dev]
+python -m pytest -q
+```
+
+Tests in `tests/test_tools.py` cover path safety and symlink traversal,
+write-allowlist prefix lookalikes, exec blocklist variants and
+shell-free execution, HTTP SSRF guards (with mocked DNS), tool-call
+parsing (JSON, quoted commas, parentheses), and ID uniqueness.
+
 ## Models
 
 | Role | Model | VRAM | Purpose |
