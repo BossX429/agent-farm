@@ -937,64 +937,37 @@ async def exec_swarm(commands: str) -> dict:
     Example: ["ls -la", "pwd", "whoami"]
     BLOCKED: rm -rf, sudo, dd, mkfs, chmod 777, pipe-to-shell, etc.
     NOTE: blocklist only, not a sandbox -- local trusted use only.
+
+    This previously kept its own older blocklist and always used
+    shell=True, bypassing the hardening in tools.tool_exec_cmd
+    (shell-free simple commands, multi-line and substitution blocks).
+    It now delegates to tools.tool_exec_cmd for every command, so both
+    paths enforce exactly the same rules.
     """
     import time
-    import subprocess
+    from .tools import tool_exec_cmd
     start = time.time()
-    
+
     try:
         cmds = json.loads(commands)
     except json.JSONDecodeError:
         cmds = [commands]  # Single command
-    
-    # Dangerous command patterns. NOTE: this is a blocklist, not a sandbox
-    # (see the note above BLOCKED_COMMANDS in tools.py): it reduces
-    # accidental damage only. This server must run locally with trusted
-    # prompts only. Whitespace is collapsed before matching so
-    # "rm  -rf" cannot evade "rm -rf".
-    blocked = [
-        "rm -rf", "rm -r", "rm --recursive", "rm --force", "rm -fr", "rm -f /",
-        "rm -r /", "unlink", "shred", "wipe",
-        "sudo", "su -", "su ", "doas", "pkexec", "runuser",
-        "chown", "chgrp", "chmod 777", "chmod -r 777", "chmod 000",
-        "dd ", "dd if=", "mkfs", "mkswap", "fdisk", "parted",
-        ":(){", ":(){ :|:& };:", "> /dev/sd", "> /dev/mem", "of=/dev/sd",
-        "mv /* ", "mv /", "cp /dev/null",
-        "wget|sh", "curl|sh", "wget | sh", "curl | sh",
-        "| sh", "| bash", "| zsh", "| dash",
-        "chmod -R 777", "chown -R", "shutdown", "reboot", "poweroff", "halt",
-        "init 0", "init 6", "systemctl poweroff", "systemctl reboot",
-        "kill -9 1", "kill -9", "pkill", "killall",
-        "iptables -f", "iptables --flush",
-    ]
 
     def execute_cmd(cmd: str) -> dict:
-        # Safety check (blocklist only -- see note above)
-        import re as _re
-        cmd_lower = _re.sub(r"\s+", " ", cmd.lower())
-        for b in blocked:
-            if b in cmd_lower:
-                return {"command": cmd, "error": f"Blocked dangerous pattern: {b}", "status": "blocked"}
-        
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30  # 30 second max
-            )
+        result = tool_exec_cmd(cmd)
+        if "error" in result:
             return {
                 "command": cmd,
-                "stdout": result.stdout[:2000] if result.stdout else "",
-                "stderr": result.stderr[:500] if result.stderr else "",
-                "returncode": result.returncode,
-                "status": "success" if result.returncode == 0 else "failed"
+                "error": result["error"],
+                "status": "blocked" if result["error"].startswith("Blocked") else "error",
             }
-        except subprocess.TimeoutExpired:
-            return {"command": cmd, "error": "Timeout (30s)", "status": "timeout"}
-        except Exception as e:
-            return {"command": cmd, "error": str(e), "status": "error"}
+        return {
+            "command": cmd,
+            "stdout": (result.get("stdout") or "")[:2000],
+            "stderr": (result.get("stderr") or "")[:500],
+            "returncode": result.get("returncode"),
+            "status": "success" if result.get("returncode") == 0 else "failed",
+        }
     
     results = []
     with ThreadPoolExecutor(max_workers=min(len(cmds), 8)) as executor:
@@ -1016,43 +989,41 @@ async def api_swarm(requests: str) -> dict:
     Execute parallel HTTP API requests.
     requests: JSON array of {url, method?, headers?, body?}
     Example: [{"url": "https://api.example.com/data"}, {"url": "...", "method": "POST", "body": "{}"}]
+
+    This previously called httpx directly with no URL validation,
+    bypassing the SSRF guard in tools.http_get/http_post. It now
+    delegates to tools._http_request for every request, so public-URL
+    only, redirect re-validation, and method checks apply here too.
     """
     import time
+    from .tools import _http_request
     start = time.time()
-    
+
     try:
         reqs = json.loads(requests)
     except json.JSONDecodeError:
         return {"error": "Invalid JSON for requests"}
-    
+
     def execute_request(req: dict) -> dict:
         url = req.get("url", "")
         method = req.get("method", "GET").upper()
-        headers = req.get("headers", {})
-        body = req.get("body", None)
-        
-        try:
-            with httpx.Client(timeout=30.0) as client:
-                if method == "GET":
-                    resp = client.get(url, headers=headers)
-                elif method == "POST":
-                    resp = client.post(url, headers=headers, content=body)
-                elif method == "PUT":
-                    resp = client.put(url, headers=headers, content=body)
-                elif method == "DELETE":
-                    resp = client.delete(url, headers=headers)
-                else:
-                    return {"url": url, "error": f"Unsupported method: {method}"}
-                
-                return {
-                    "url": url,
-                    "method": method,
-                    "status_code": resp.status_code,
-                    "body": resp.text[:2000] if resp.text else "",
-                    "status": "success"
-                }
-        except Exception as e:
-            return {"url": url, "method": method, "error": str(e), "status": "failed"}
+        headers = req.get("headers", {}) or {}
+        body = req.get("body") or ""
+        result = _http_request(method, url, body=body, headers=headers)
+        if "error" in result:
+            return {
+                "url": url,
+                "method": method,
+                "error": result["error"],
+                "status": "blocked" if "Blocked" in result["error"] else "failed",
+            }
+        return {
+            "url": url,
+            "method": method,
+            "status_code": result.get("status"),
+            "body": (result.get("body") or "")[:2000],
+            "status": "success",
+        }
     
     results = []
     with ThreadPoolExecutor(max_workers=min(len(reqs), 10)) as executor:
