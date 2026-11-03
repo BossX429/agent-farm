@@ -1,5 +1,5 @@
 """
-Agent Farm v3.3 - Structured Output Edition
+Agent Farm v3.4 - Structured Output Edition
 - Ollama structured output for reliable tool parsing
 - JSON schema enforcement via constrained decoding
 - Regex fallback for edge cases

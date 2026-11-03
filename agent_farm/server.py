@@ -1085,7 +1085,7 @@ async def kmkb_swarm(queries: str, synthesize: bool = True) -> dict:
             with httpx.Client() as client:
                 resp = client.post(
                     f"{KMKB_URL}/api/generate",
-                    json={"model": "qwen3:4b", "prompt": query, "stream": False},
+                    json={"model": MODEL_TIERS["worker"], "prompt": query, "stream": False},
                     timeout=60.0
                 )
                 if resp.status_code == 200:
@@ -1096,7 +1096,9 @@ async def kmkb_swarm(queries: str, synthesize: bool = True) -> dict:
         return {"query": query, "error": "No response", "status": "failed"}
     
     results = []
-    with ThreadPoolExecutor(max_workers=len(q_list)) as executor:
+    # Cap workers at 8 like exec_swarm/file_swarm: the old
+    # max_workers=len(q_list) let a long query list spike threads.
+    with ThreadPoolExecutor(max_workers=max(1, min(len(q_list), 8))) as executor:
         futures = [executor.submit(query_kmkb, q) for q in q_list]
         for future in as_completed(futures):
             results.append(future.result())
