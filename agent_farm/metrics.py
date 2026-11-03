@@ -29,7 +29,9 @@ colonies themselves. They are exposed through farm_stats(), not a
 new MCP tool, so the MCP tool count does not change.
 """
 
+import functools
 import threading
+import time
 from typing import Any, Dict, Optional
 
 _LOCK = threading.Lock()
@@ -99,3 +101,42 @@ def reset_metrics() -> None:
     """Clear all metrics. Used by tests; not an MCP tool."""
     with _LOCK:
         _DATA.clear()
+
+
+def track_tool_run(tool_name=None):
+    """Decorator for async MCP tools: record one run in the metrics.
+
+    It never changes the tool's return value. A run counts as a
+    failure only if the tool raises, or returns a dict containing an
+    "error" key. "items" is taken from a "results" list when the tool
+    returns one, otherwise 0 -- swarm tools report their counts in
+    different fields, so a missing items count is honest, not guessed.
+    Chunked tools record themselves (they also report validation
+    outcomes), so do not apply this decorator to them or they will
+    be counted twice.
+    """
+    def decorator(fn):
+        name = tool_name or fn.__name__
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            start = time.time()
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception:
+                record_tool_run(name, time.time() - start, False)
+                raise
+            success = not (
+                isinstance(result, dict) and "error" in result
+            )
+            items = 0
+            if isinstance(result, dict):
+                results = result.get("results")
+                if isinstance(results, list):
+                    items = len(results)
+            record_tool_run(name, time.time() - start, success, items=items)
+            return result
+
+        return wrapper
+
+    return decorator
