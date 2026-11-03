@@ -9,6 +9,8 @@ import re
 import json
 import shlex
 import socket
+import ssl
+import http.client
 import ipaddress
 import subprocess
 import httpx
@@ -44,13 +46,17 @@ BLOCKED_PATHS = ["/etc/shadow", "/etc/passwd", "/etc/gshadow", "/etc/sudoers",
 ALLOWED_WRITE_DIRS = ["/tmp", "/home/kyle/repos", "/home/kyle/Desktop"]
 
 # SECURITY NOTE -- READ BEFORE RELAXING THIS LIST:
-# exec_cmd() runs with shell=True on LLM-generated commands. That is
-# inherently risky: a substring blocklist can only reduce accidental damage,
-# it cannot make shell execution safe against a determined or prompt-injected
-# command (quoting, $(), backticks, alternate spellings, and new utilities
-# can all evade it). This server must therefore only run locally, with
-# trusted prompts, and must NOT be exposed to untrusted files, web pages,
-# or other users' prompts as if this list were a sandbox. It is not one.
+# exec_cmd() never runs a shell. Simple commands run shell=False, and
+# the only complex form allowed is a safe pipeline (see
+# _parse_safe_pipeline): stages joined by a single '|', each stage a
+# plain argument list, with no chaining, redirection, substitution,
+# backgrounding, or shell expansion. A substring blocklist is kept as
+# defence-in-depth only -- it is no longer the thing standing between
+# a prompt-injected command and the shell, because there is no shell.
+# Even so, exec_cmd still runs arbitrary binaries with the server's
+# privileges, so this server must only run locally, with trusted
+# prompts, and must NOT be exposed to untrusted files, web pages, or
+# other users' prompts as if this were a sandbox. It is not one.
 # Blocked command patterns (matched after lower-casing and collapsing
 # whitespace, so "rm  -rf" and "rm\t-rf" are caught too).
 BLOCKED_COMMANDS = [
@@ -169,6 +175,150 @@ def _is_simple_command(cmd: str) -> bool:
     return bool(parts)
 
 
+# Maximum stages in a safe pipeline. Pipelines like
+# "find /tmp -type f | sort | head -20" need only a few stages, and a
+# cap stops a request from spawning an unbounded process chain.
+MAX_PIPELINE_STAGES = 5
+
+# Shell syntax that is never allowed in exec_cmd, even inside a pipeline:
+# chaining/backgrounding, redirection, and substitution. A single '|'
+# between stages is the only operator a pipeline may contain.
+_FORBIDDEN_SHELL_CHARS = set(";<>$`&\n\r")
+
+
+def _parse_safe_pipeline(cmd: str) -> Optional[List[List[str]]]:
+    """Parse `cmd` as a safe pipeline, or return None if it is not one.
+
+    A safe pipeline is 2..MAX_PIPELINE_STAGES stages joined by a single
+    '|'. Each stage must shlex-split into a non-empty argument list and
+    must pass the command blocklist. No other shell syntax is allowed:
+    '||', '|&', ';', '&&', '&', '>', '<', '$', backticks, and
+    newlines are all rejected, even inside quotes, because quoting does
+    not make substitution or redirection safe here. Glob characters
+    ('*', '?') are passed through literally -- they are NOT expanded
+    by a shell, so "ls *.py" will not behave like it does in a shell;
+    use a tool that expands patterns itself, or list a directory.
+    """
+    if not cmd or not cmd.strip():
+        return None
+    # Split on unquoted '|' and reject every other shell operator.
+    stages_raw: List[str] = []
+    current: List[str] = []
+    in_single = False
+    in_double = False
+    escaped = False
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if escaped:
+            current.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            current.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            current.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+            i += 1
+            continue
+        if ch in _FORBIDDEN_SHELL_CHARS:
+            return None
+        if ch == "|":
+            # '||' and '|&' are chaining, not a pipeline.
+            if i + 1 < len(cmd) and cmd[i + 1] in ("|", "&"):
+                return None
+            stages_raw.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    if in_single or in_double:
+        return None
+    stages_raw.append("".join(current))
+    if len(stages_raw) < 2 or len(stages_raw) > MAX_PIPELINE_STAGES:
+        return None
+    stages: List[List[str]] = []
+    for raw in stages_raw:
+        if not raw.strip():
+            return None
+        try:
+            parts = shlex.split(raw)
+        except ValueError:
+            return None
+        if not parts:
+            return None
+        # Per-stage blocklist check, in addition to the whole-command
+        # check in tool_exec_cmd, so a blocked command cannot hide as
+        # a later pipeline stage.
+        if not is_command_safe(" ".join(parts)):
+            return None
+        stages.append(parts)
+    return stages
+
+
+def _run_pipeline(stages: List[List[str]]) -> Dict:
+    """Run argument-array stages piped together, with no shell.
+
+    The first stage reads from /dev/null (never the terminal), each
+    later stage reads the previous stage's stdout, and only the last
+    stage's stdout/stderr are returned. Earlier stages' stderr goes to
+    /dev/null so a noisy early stage cannot deadlock the pipe.
+    """
+    procs = []
+    try:
+        prev_stdout = None
+        for idx, argv in enumerate(stages):
+            is_last = idx == len(stages) - 1
+            proc = subprocess.Popen(
+                argv,
+                shell=False,
+                stdin=prev_stdout if prev_stdout is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE if is_last else subprocess.DEVNULL,
+                text=True,
+            )
+            if prev_stdout is not None:
+                prev_stdout.close()
+            procs.append(proc)
+            prev_stdout = proc.stdout
+        try:
+            stdout, stderr = procs[-1].communicate(timeout=EXEC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            for proc in procs:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            for proc in procs:
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            return {"error": f"Command timed out ({EXEC_TIMEOUT}s)"}
+        return {
+            "stdout": (stdout or "")[:MAX_OUTPUT],
+            "stderr": (stderr or "")[:1000],
+            "returncode": procs[-1].returncode,
+        }
+    except Exception as e:
+        for proc in procs:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return {"error": str(e)}
+
+
 # ============ HTTP / SSRF GUARDS ============
 # http_get/http_post previously accepted any URL, including localhost and
 # private-network addresses, which is a classic SSRF hole: a prompt-injected
@@ -178,14 +328,112 @@ def _is_simple_command(cmd: str) -> bool:
 # redirects are re-validated hop by hop, so a public URL cannot redirect
 # the request to a private address.
 #
-# Escape hatch, off by default, for local testing only:
-#   AGENT_FARM_ALLOW_PRIVATE_HTTP=1  -- allow private/loopback URLs
+# Escape hatches, off by default, for local testing only:
+#   AGENT_FARM_ALLOW_PRIVATE_HTTP=1  -- relax ONLY the private-IP rule.
+#     Scheme validation and credential rejection still apply, and the
+#     URL must still resolve. Previously this flag returned True
+#     before any check, so it also bypassed scheme and credential
+#     validation -- that bypass is fixed here.
 #   AGENT_FARM_ALLOWED_HTTP_HOSTS=host1,host2 -- allow these hosts even
-#     if they resolve privately (e.g. an internal test service)
+#     if they resolve privately (e.g. an internal test service).
+#     Scheme and credential checks still apply to them, and they must
+#     still resolve to an address (previously they were accepted
+#     without any DNS check, which made IP pinning impossible).
+#
+# DNS rebinding defence: validation used to resolve a hostname with
+# getaddrinfo() and then let httpx resolve it again on its own, so a
+# hostile DNS answer could change between the check and the connection
+# (time-of-check / time-of-use). _http_request now resolves once,
+# validates every returned address, and then connects to that exact
+# validated IP -- see _PinnedHTTPConnection / _PinnedHTTPSConnection.
+# The Host header and, for https, the TLS server name stay as the
+# original hostname, so certificate verification still checks the
+# hostname, not the IP. Redirects go through the same validate-then-
+# pin step on every hop, so a redirect cannot slip in a new,
+# unvalidated address either.
+#
+# Remaining limitation, stated honestly: pinning closes the gap for
+# the connection this code makes, but it cannot control DNS answers
+# for other clients, and a hostname that legitimately rotates between
+# several public IPs will be served by the single IP pinned at
+# validation time (a failover IP will not be tried). If the pinned
+# address stops answering, the request fails rather than falling back
+# to a fresh, unvalidated lookup.
 
 def _allowed_http_hosts() -> set:
     raw = os.environ.get("AGENT_FARM_ALLOWED_HTTP_HOSTS", "")
     return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
+def _is_non_public_ip(ip: "ipaddress._BaseAddress") -> bool:
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified)
+
+
+def _validate_url(url: str) -> Optional[Dict]:
+    """Validate `url` and return its pinned connection info, or None.
+
+    Returns {"parsed": ..., "host": ..., "port": ..., "pinned_ip": ...}
+    on success. Scheme and credential checks are mandatory and run
+    before any escape hatch is consulted, so neither escape hatch can
+    turn a non-http(s) URL or a credential-bearing URL into an
+    allowed one. A hostname must resolve, and every address it
+    resolves to must be public unless a private-IP escape hatch
+    applies to this host -- otherwise a rotating answer could still
+    hand the connection a private address. The pinned IP is the first
+    resolved address.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    # Mandatory, escape-hatch-proof checks first.
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if parsed.username or parsed.password:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    private_allowed = (
+        os.environ.get("AGENT_FARM_ALLOW_PRIVATE_HTTP") == "1"
+        or host in _allowed_http_hosts()
+    )
+    if (host in ("localhost",) or host.endswith((".localhost", ".local", ".internal"))) \
+            and not private_allowed:
+        return None
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    # IP literals must be checked directly, not via DNS (a mocked or
+    # poisoned resolver must not be able to launder 127.0.0.1 into a
+    # public address).
+    try:
+        literal = ipaddress.ip_address(host)
+        if _is_non_public_ip(literal) and not private_allowed:
+            return None
+        return {"parsed": parsed, "host": host, "port": port, "pinned_ip": str(literal)}
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return None
+    if not infos:
+        return None
+    ips: List[str] = []
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            return None
+        if _is_non_public_ip(ip) and not private_allowed:
+            return None
+        if str(ip) not in ips:
+            ips.append(str(ip))
+    if not ips:
+        return None
+    return {"parsed": parsed, "host": host, "port": port, "pinned_ip": ips[0]}
 
 
 def is_url_public(url: str) -> bool:
@@ -193,82 +441,124 @@ def is_url_public(url: str) -> bool:
 
     Fails closed on DNS failure, non-http(s) schemes, credentials in the
     URL, localhost names, and any resolved address that is private,
-    loopback, link-local, multicast, reserved, or unspecified.
+    loopback, link-local, multicast, reserved, or unspecified -- unless
+    a private-IP escape hatch applies to this host, in which case only
+    the private-IP rule is relaxed (scheme and credential checks
+    still apply).
     """
-    if os.environ.get("AGENT_FARM_ALLOW_PRIVATE_HTTP") == "1":
-        return True
+    return _validate_url(url) is not None
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection that connects to a validated IP, not a hostname.
+
+    self.host stays as the original hostname, so the Host header is
+    correct. connect() deliberately does NOT use socket.create_connection
+    (which would call getaddrinfo again and re-open the rebinding gap);
+    it opens a socket directly to the pinned IP.
+    """
+
+    pinned_ip: str = ""
+
+    def connect(self) -> None:  # type: ignore[override]
+        ip = ipaddress.ip_address(self.pinned_ip)
+        family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+        self.sock = socket.socket(family, socket.SOCK_STREAM)
+        if self.timeout is not None:
+            self.sock.settimeout(self.timeout)
+        address = (str(ip), self.port, 0, 0) if ip.version == 6 else (str(ip), self.port)
+        self.sock.connect(address)  # type: ignore[arg-type]
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection pinned to a validated IP, with hostname TLS.
+
+    As above, the socket goes to the pinned IP, but the TLS handshake
+    uses server_hostname=self.host, so the certificate is still
+    verified against the original hostname, not the IP.
+    """
+
+    pinned_ip: str = ""
+
+    def connect(self) -> None:  # type: ignore[override]
+        ip = ipaddress.ip_address(self.pinned_ip)
+        family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        if self.timeout is not None:
+            sock.settimeout(self.timeout)
+        address = (str(ip), self.port, 0, 0) if ip.version == 6 else (str(ip), self.port)
+        sock.connect(address)  # type: ignore[arg-type]
+        context = self._context or ssl._create_default_https_context()
+        self.sock = context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _fetch_pinned(method: str, validated: Dict, body: str = "",
+                  headers: Optional[Dict] = None) -> Dict:
+    """Make one request to a validated, pinned address.
+
+    Returns {"status": ..., "headers": ..., "body": ...} (body is
+    decoded text, truncated by the caller). Raises on transport errors.
+    No DNS lookup happens here: the connection class connects
+    directly to validated["pinned_ip"].
+    """
+    parsed = validated["parsed"]
+    scheme = parsed.scheme
+    host = validated["host"]
+    port = validated["port"]
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    conn_cls = _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
+    conn = conn_cls(host, port, timeout=30.0)
+    conn.pinned_ip = validated["pinned_ip"]  # type: ignore[attr-defined]
     try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-    if parsed.scheme not in ("http", "https"):
-        return False
-    if parsed.username or parsed.password:
-        return False
-    host = (parsed.hostname or "").lower()
-    if not host:
-        return False
-    if host in ("localhost",) or host.endswith((".localhost", ".local", ".internal")):
-        return False
-    if host in _allowed_http_hosts():
-        return True
-    # IP literals must be checked directly, not via DNS (a mocked or
-    # poisoned resolver must not be able to launder 127.0.0.1 into a
-    # public address).
-    try:
-        literal = ipaddress.ip_address(host)
-        return not (literal.is_private or literal.is_loopback or literal.is_link_local
-                    or literal.is_multicast or literal.is_reserved or literal.is_unspecified)
-    except ValueError:
-        pass
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except Exception:
-        return False
-    if not infos:
-        return False
-    for info in infos:
+        conn.request(method, path, body=body.encode("utf-8") if body else None,
+                     headers=dict(headers or {}))
+        resp = conn.getresponse()
+        raw = resp.read()
         try:
-            ip = ipaddress.ip_address(info[4][0])
+            charset = resp.headers.get_content_charset() or "utf-8"  # type: ignore[attr-defined]
         except Exception:
-            return False
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-            return False
-    return True
+            charset = "utf-8"
+        text = raw.decode(charset, errors="replace")
+        resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+        return {"status": resp.status, "headers": resp_headers, "body": text}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _http_request(method: str, url: str, body: str = "", headers: Optional[Dict] = None) -> Dict:
     """Fetch a URL after SSRF validation, re-validating redirects.
 
     This is the single HTTP path for both `http_get`/`http_post` and
-    `api_swarm` in server.py, so a swarm request cannot bypass the guard
-    by calling httpx directly. Only GET follows redirects, and each
-    redirect target is re-validated. Other methods return the redirect
-    response as-is rather than following it blindly.
+    `api_swarm`, so a swarm request cannot bypass the guard by calling
+    a client directly. Only GET follows redirects, and each redirect
+    target is re-validated and re-pinned. Other methods return the
+    redirect response as-is rather than following it blindly.
     """
     method = (method or "GET").upper()
     if method not in ("GET", "POST", "PUT", "DELETE"):
         return {"url": url, "error": f"Unsupported method: {method}"}
-    if not is_url_public(url):
-        return {"url": url, "error": "Blocked URL: only public http/https URLs are allowed"}
     try:
-        with httpx.Client(timeout=30.0, follow_redirects=False) as client:
-            current_url = url
-            for _ in range(4):
-                resp = client.request(method, current_url, content=body,
-                                      headers=headers or {})
-                location = resp.headers.get("location")
-                if (method == "GET" and resp.status_code in (301, 302, 303, 307, 308)
-                        and location):
-                    next_url = urljoin(current_url, location)
-                    if not is_url_public(next_url):
-                        return {"url": url, "error": "Blocked redirect to a non-public URL"}
-                    current_url = next_url
-                    continue
-                return {"url": url, "status": resp.status_code,
-                        "body": resp.text[:MAX_OUTPUT]}
-            return {"url": url, "error": "Too many redirects"}
+        current_url = url
+        for _ in range(4):
+            validated = _validate_url(current_url)
+            if validated is None:
+                if current_url == url:
+                    return {"url": url, "error": "Blocked URL: only public http/https URLs are allowed"}
+                return {"url": url, "error": "Blocked redirect to a non-public URL"}
+            resp = _fetch_pinned(method, validated, body=body, headers=headers)
+            location = resp["headers"].get("location")
+            if (method == "GET" and resp["status"] in (301, 302, 303, 307, 308)
+                    and location):
+                current_url = urljoin(current_url, location)
+                continue
+            return {"url": url, "status": resp["status"],
+                    "body": resp["body"][:MAX_OUTPUT]}
+        return {"url": url, "error": "Too many redirects"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -331,14 +621,22 @@ def tool_file_exists(path: str) -> Dict:
 
 
 def tool_exec_cmd(cmd: str) -> Dict:
-    """Execute a command.
+    """Execute a command, with no shell involved.
 
-    Simple commands (no pipes, redirection, chaining, or substitution)
-    now run with shell=False, so their arguments cannot be interpreted
-    as shell syntax at all. Complex shell commands still use shell=True
-    after the blocklist check, so this is still NOT a sandbox -- see the
-    note above BLOCKED_COMMANDS. Run locally with trusted prompts only.
-    Multi-line commands are rejected outright.
+    Allowed forms, and only these:
+    - A simple command: one argument list, run shell=False.
+    - A safe pipeline: stages joined by a single '|', each stage an
+      argument list, run as argument-array processes piped together
+      (see _parse_safe_pipeline).
+
+    Everything else is rejected: chaining (';', '&&', '||'),
+    redirection ('>', '<'), substitution ('$()', backticks, '${}'),
+    backgrounding ('&'), and multi-line commands. This is an
+    intentional breaking change for commands that previously ran
+    with shell=True: use separate exec_cmd calls instead of '&&' /
+    '||', and use write_file instead of shell redirection. This is
+    still NOT a sandbox -- the allowed binaries run with the server's
+    privileges -- so run locally with trusted prompts only.
     """
     if "\n" in cmd or "\r" in cmd:
         return {"error": "Blocked multi-line command"}
@@ -350,16 +648,27 @@ def tool_exec_cmd(cmd: str) -> Dict:
                 shlex.split(cmd), shell=False, capture_output=True,
                 text=True, timeout=EXEC_TIMEOUT
             )
-        else:
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=EXEC_TIMEOUT
-            )
-        return {
-            "command": cmd,
-            "stdout": result.stdout[:MAX_OUTPUT],
-            "stderr": result.stderr[:1000],
-            "returncode": result.returncode
-        }
+            return {
+                "command": cmd,
+                "stdout": result.stdout[:MAX_OUTPUT],
+                "stderr": result.stderr[:1000],
+                "returncode": result.returncode
+            }
+        stages = _parse_safe_pipeline(cmd)
+        if stages is not None:
+            result = _run_pipeline(stages)
+            if "error" in result:
+                return {"error": result["error"]}
+            return {
+                "command": cmd,
+                "stdout": result["stdout"],
+                "stderr": result["stderr"],
+                "returncode": result["returncode"],
+            }
+        return {"error": "Blocked complex shell command: only simple commands and "
+                         "safe pipelines (stages joined by a single '|', no "
+                         "redirection, chaining, substitution, or backgrounding) "
+                         "are allowed"}
     except subprocess.TimeoutExpired:
         return {"error": f"Command timed out ({EXEC_TIMEOUT}s)"}
     except Exception as e:
