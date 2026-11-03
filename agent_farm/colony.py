@@ -122,6 +122,10 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
     import time
     start = time.time()
     results = []
+    # No tasks, or no bugs to run them: return without creating a
+    # pool at all (ThreadPoolExecutor(max_workers=0) would raise).
+    if not tasks or not colony.bugs:
+        return results
     
     # Smart routing - match tasks to appropriate bugs
     bug_assignments = []
@@ -139,8 +143,8 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
         used_bugs.add(bug.id)
         bug_assignments.append((bug, task))
     
-    # Execute in parallel
-    with ThreadPoolExecutor(max_workers=len(colony.bugs)) as executor:
+    # Execute in parallel (workers capped, never zero -- see guard above)
+    with ThreadPoolExecutor(max_workers=max(1, min(len(colony.bugs), 8))) as executor:
         futures = {}
         for bug, task in bug_assignments:
             prompt = task.get("prompt", "")
