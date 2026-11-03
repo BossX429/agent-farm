@@ -358,12 +358,11 @@ async def exec_swarm(commands: str) -> dict:
     commands: JSON array of command strings
     Example: ["ls -la", "pwd", "whoami"]
     BLOCKED: rm -rf, sudo, dd, mkfs, chmod 777, pipe-to-shell, etc.
-    NOTE: blocklist only, not a sandbox -- local trusted use only.
+    NOTE: no shell is used at all -- only simple commands and safe
+    pipelines (see tools.tool_exec_cmd). Still not a sandbox --
+    local trusted use only.
 
-    This previously kept its own older blocklist and always used
-    shell=True, bypassing the hardening in tools.tool_exec_cmd
-    (shell-free simple commands, multi-line and substitution blocks).
-    It now delegates to tools.tool_exec_cmd for every command, so both
+    It delegates to tools.tool_exec_cmd for every command, so both
     paths enforce exactly the same rules.
     """
     import time
@@ -422,7 +421,8 @@ async def api_swarm(requests: str, allow_mutating: bool = False) -> dict:
     This previously called httpx directly with no URL validation,
     bypassing the SSRF guard in tools.http_get/http_post. It now
     delegates to tools._http_request for every request, so public-URL
-    only, redirect re-validation, and method checks apply here too.
+    only, redirect re-validation, IP pinning, and method checks apply
+    here too.
     """
     import time
     from .tools import _http_request
