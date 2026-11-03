@@ -7,9 +7,13 @@ Speed optimized with expanded permissions.
 import os
 import re
 import json
+import shlex
+import socket
+import ipaddress
 import subprocess
 import httpx
-from typing import Dict, List, Any, Callable
+from urllib.parse import urlparse, urljoin
+from typing import Dict, List, Any, Callable, Optional
 from dataclasses import dataclass
 
 # Role-specific tool permissions
@@ -68,6 +72,9 @@ BLOCKED_COMMANDS = [
     ":(){", ":(){ :|:& };:", "| sh", "| bash", "| zsh", "| dash",
     "curl|sh", "curl | sh", "wget|sh", "wget | sh",
     "iptables -f", "iptables --flush",
+    # command substitution / evaluation -- these turn a "harmless" command
+    # into an arbitrary second command, so they are blocked outright.
+    "$(", "`", "${", "eval ", "exec ", "source ",
 ]
 
 
@@ -116,6 +123,122 @@ def is_command_safe(cmd: str) -> bool:
         if blocked in cmd_lower:
             return False
     return True
+
+
+# Characters that make a command need a real shell (pipes, redirection,
+# chaining, substitution, globbing via the shell). A command without any
+# of these is run with shell=False, so shell metacharacters in its
+# arguments cannot be interpreted at all.
+_SHELL_METACHARS = set(";|&$`><\n\r")
+
+
+def _is_simple_command(cmd: str) -> bool:
+    """True iff `cmd` is a single argv-style command with no shell syntax."""
+    if not cmd or not cmd.strip():
+        return False
+    if any(ch in _SHELL_METACHARS for ch in cmd):
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return False
+    return bool(parts)
+
+
+# ============ HTTP / SSRF GUARDS ============
+# http_get/http_post previously accepted any URL, including localhost and
+# private-network addresses, which is a classic SSRF hole: a prompt-injected
+# URL could reach internal services (metadata endpoints, local admin
+# panels, the KMKB port, etc.) and return their responses to the model.
+# These helpers fail closed: only public http/https URLs are allowed, and
+# redirects are re-validated hop by hop, so a public URL cannot redirect
+# the request to a private address.
+#
+# Escape hatch, off by default, for local testing only:
+#   AGENT_FARM_ALLOW_PRIVATE_HTTP=1  -- allow private/loopback URLs
+#   AGENT_FARM_ALLOWED_HTTP_HOSTS=host1,host2 -- allow these hosts even
+#     if they resolve privately (e.g. an internal test service)
+
+def _allowed_http_hosts() -> set:
+    raw = os.environ.get("AGENT_FARM_ALLOWED_HTTP_HOSTS", "")
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
+def is_url_public(url: str) -> bool:
+    """True iff `url` is a public http/https URL safe to fetch.
+
+    Fails closed on DNS failure, non-http(s) schemes, credentials in the
+    URL, localhost names, and any resolved address that is private,
+    loopback, link-local, multicast, reserved, or unspecified.
+    """
+    if os.environ.get("AGENT_FARM_ALLOW_PRIVATE_HTTP") == "1":
+        return True
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if host in ("localhost",) or host.endswith((".localhost", ".local", ".internal")):
+        return False
+    if host in _allowed_http_hosts():
+        return True
+    # IP literals must be checked directly, not via DNS (a mocked or
+    # poisoned resolver must not be able to launder 127.0.0.1 into a
+    # public address).
+    try:
+        literal = ipaddress.ip_address(host)
+        return not (literal.is_private or literal.is_loopback or literal.is_link_local
+                    or literal.is_multicast or literal.is_reserved or literal.is_unspecified)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return False
+    return True
+
+
+def _http_request(method: str, url: str, body: str = "") -> Dict:
+    """Fetch a URL after SSRF validation, re-validating redirects."""
+    if not is_url_public(url):
+        return {"url": url, "error": "Blocked URL: only public http/https URLs are allowed"}
+    try:
+        with httpx.Client(timeout=30.0, follow_redirects=False) as client:
+            current_url = url
+            for _ in range(4):
+                if method == "POST":
+                    resp = client.post(current_url, content=body)
+                else:
+                    resp = client.get(current_url)
+                location = resp.headers.get("location")
+                if (method == "GET" and resp.status_code in (301, 302, 303, 307, 308)
+                        and location):
+                    next_url = urljoin(current_url, location)
+                    if not is_url_public(next_url):
+                        return {"url": url, "error": "Blocked redirect to a non-public URL"}
+                    current_url = next_url
+                    continue
+                return {"url": url, "status": resp.status_code,
+                        "body": resp.text[:MAX_OUTPUT]}
+            return {"url": url, "error": "Too many redirects"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ============ TOOL IMPLEMENTATIONS ============
@@ -176,17 +299,29 @@ def tool_file_exists(path: str) -> Dict:
 
 
 def tool_exec_cmd(cmd: str) -> Dict:
-    """Execute a shell command.
+    """Execute a command.
 
-    Safety is a blocklist only (see the note above BLOCKED_COMMANDS):
-    this is NOT a sandbox. Run locally with trusted prompts only.
+    Simple commands (no pipes, redirection, chaining, or substitution)
+    now run with shell=False, so their arguments cannot be interpreted
+    as shell syntax at all. Complex shell commands still use shell=True
+    after the blocklist check, so this is still NOT a sandbox -- see the
+    note above BLOCKED_COMMANDS. Run locally with trusted prompts only.
+    Multi-line commands are rejected outright.
     """
+    if "\n" in cmd or "\r" in cmd:
+        return {"error": "Blocked multi-line command"}
     if not is_command_safe(cmd):
-        return {"error": f"Blocked dangerous command pattern"}
+        return {"error": "Blocked dangerous command pattern"}
     try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=EXEC_TIMEOUT
-        )
+        if _is_simple_command(cmd):
+            result = subprocess.run(
+                shlex.split(cmd), shell=False, capture_output=True,
+                text=True, timeout=EXEC_TIMEOUT
+            )
+        else:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=EXEC_TIMEOUT
+            )
         return {
             "command": cmd,
             "stdout": result.stdout[:MAX_OUTPUT],
@@ -200,23 +335,13 @@ def tool_exec_cmd(cmd: str) -> Dict:
 
 
 def tool_http_get(url: str) -> Dict:
-    """HTTP GET request"""
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.get(url)
-            return {"url": url, "status": resp.status_code, "body": resp.text[:MAX_OUTPUT]}
-    except Exception as e:
-        return {"error": str(e)}
+    """HTTP GET request (public URLs only; see is_url_public)."""
+    return _http_request("GET", url)
 
 
 def tool_http_post(url: str, body: str = "") -> Dict:
-    """HTTP POST request"""
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.post(url, content=body)
-            return {"url": url, "status": resp.status_code, "body": resp.text[:MAX_OUTPUT]}
-    except Exception as e:
-        return {"error": str(e)}
+    """HTTP POST request (public URLs only; see is_url_public)."""
+    return _http_request("POST", url, body=body)
 
 
 def tool_system_status() -> Dict:
