@@ -32,17 +32,25 @@ async def code_review_swarm(code: str, filepath: str = "") -> dict:
     import time
     start = time.time()
     
-    # Read from file if filepath provided
+    # Read from file if filepath provided, through the same safe read
+    # path as tool_read_file -- not a direct open(). Previously this
+    # opened any path directly, with no blocked-path check and no byte
+    # limit, so a model could ask it to read a sensitive file. Now it
+    # is blocked for system directories and sensitive files, and capped
+    # at 100KB by tool_read_file, before the 500-line truncation below.
     if filepath and not code:
-        try:
-            with open(filepath, 'r') as f:
-                code = f.read()
-        except Exception as e:
-            return {"error": f"Failed to read {filepath}: {str(e)}"}
-    
+        from .tools import tool_read_file, is_swarm_read_allowed
+
+        if not is_swarm_read_allowed(filepath):
+            return {"error": f"Blocked path: {filepath}"}
+        result = tool_read_file(filepath)
+        if "error" in result:
+            return {"error": f"Failed to read {filepath}: {result['error']}"}
+        code = result["content"]
+
     if not code:
         return {"error": "No code provided. Pass code or filepath."}
-    
+
     # Truncate if too long (keep first 500 lines max)
     lines = code.split('\n')
     if len(lines) > 500:
@@ -266,55 +274,60 @@ async def file_swarm(operations: str) -> dict:
         raw_path = op.get("path", "")
         content = op.get("content", "")
 
-        # Safety: canonical (symlink-resolved) path checks, not raw
-        # startswith(). The old check blocked "/etc" etc. as prefixes but
-        # allowed everything else -- including home, repos, and Documents --
-        # for read/write/append/delete, and a symlink in an allowed spot
-        # pointing at a blocked spot passed it. Blocked entries are matched
-        # as whole directories/files via commonpath(); everything under
-        # the user's home that is not explicitly blocked is still reachable
-        # here by design for a local tool, but sensitive system paths are
-        # not, and neither are symlinks that resolve into them.
-        # NOTE: this is still not a sandbox -- see the exec_cmd note in
-        # tools.py. Run locally with trusted prompts only.
+        # Safety, unified with tools.py -- previously file_swarm kept its
+        # own blocked-directory list and allowed write/append/delete
+        # anywhere outside it, including the whole home directory
+        # (credentials, SSH files, Documents, etc.), while write_file
+        # only allows /tmp, /home/kyle/repos, and /home/kyle/Desktop.
+        # Now: reads/exists use the shared swarm-read check (blocked
+        # system dirs + sensitive files, canonical/symlink-resolved),
+        # and writes/appends/deletes use the shared write allowlist.
+        # Delete is therefore only allowed inside a write-allowed
+        # directory, not anywhere in home. NOTE: this is still not a
+        # sandbox -- see the exec_cmd note in tools.py. Run locally
+        # with trusted prompts only.
+        from .tools import (
+            tool_read_file,
+            tool_write_file,
+            tool_file_exists,
+            is_swarm_read_allowed,
+            is_write_path_allowed,
+            _canonical_path,
+        )
         import os as _os
 
-        def _is_within(_path: str, _directory: str) -> bool:
-            try:
-                return _os.path.commonpath([_path, _directory]) == _directory
-            except ValueError:
-                return False
-
-        expanded = _os.path.expanduser(_os.path.expandvars(raw_path)) if raw_path else ""
-        path = _os.path.realpath(expanded) if expanded else ""
-        dangerous = ["/etc", "/usr", "/bin", "/sbin", "/boot", "/root",
-                     "/sys", "/proc", "/etc/shadow", "/etc/passwd",
-                     "/etc/gshadow", "/etc/sudoers"]
-        if path and any(
-            path == _os.path.realpath(d) or _is_within(path, _os.path.realpath(d))
-            for d in dangerous
-        ):
-            return {"action": action, "path": raw_path, "error": "Dangerous path blocked"}
+        if action in ("read", "exists"):
+            if raw_path and not is_swarm_read_allowed(raw_path):
+                return {"action": action, "path": raw_path, "error": "Dangerous path blocked"}
+        elif action in ("write", "append", "delete"):
+            if raw_path and not is_write_path_allowed(raw_path):
+                return {"action": action, "path": raw_path,
+                        "error": "Write only allowed in: /tmp, /home/kyle/repos, /home/kyle/Desktop"}
 
         try:
             if action == "read":
-                with open(path, 'r') as f:
-                    # Bound reads: the old version read the whole file with
-                    # no limit, so one huge file could blow up memory.
-                    return {"action": action, "path": raw_path,
-                            "content": f.read(100000), "status": "success"}
+                result = tool_read_file(raw_path)
+                if "error" in result:
+                    return {"action": action, "path": raw_path, "error": result["error"]}
+                return {"action": action, "path": raw_path,
+                        "content": result["content"], "status": "success"}
             elif action == "write":
-                with open(path, 'w') as f:
-                    f.write(content)
-                return {"action": action, "path": raw_path, "bytes": len(content), "status": "success"}
+                result = tool_write_file(raw_path, content)
+                if "error" in result:
+                    return {"action": action, "path": raw_path, "error": result["error"]}
+                return {"action": action, "path": raw_path, "bytes": result["bytes_written"], "status": "success"}
             elif action == "append":
+                path = _canonical_path(raw_path)
                 with open(path, 'a') as f:
                     f.write(content)
                 return {"action": action, "path": raw_path, "bytes": len(content), "status": "success"}
             elif action == "exists":
-                return {"action": action, "path": raw_path, "exists": _os.path.exists(path), "status": "success"}
+                result = tool_file_exists(raw_path)
+                if "error" in result:
+                    return {"action": action, "path": raw_path, "error": result["error"]}
+                return {"action": action, "path": raw_path, "exists": result["exists"], "status": "success"}
             elif action == "delete":
-                _os.remove(path)
+                _os.remove(_canonical_path(raw_path))
                 return {"action": action, "path": raw_path, "status": "success"}
             else:
                 return {"action": action, "path": raw_path, "error": f"Unknown action: {action}"}

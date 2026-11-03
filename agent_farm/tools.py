@@ -115,6 +115,30 @@ def is_write_path_allowed(path: str) -> bool:
     )
 
 
+# Directories file_swarm and code_review_swarm must never read from, even
+# though tool_read_file alone would allow some of them (it only blocks
+# specific sensitive files, not whole system directories). This is the
+# single list both swarm tools use, so a swarm tool cannot bypass it by
+# keeping its own copy of the list.
+FILE_SWARM_BLOCKED_DIRS = ["/etc", "/usr", "/bin", "/sbin", "/boot", "/root", "/sys", "/proc"]
+
+
+def is_swarm_read_allowed(path: str) -> bool:
+    """True iff a swarm tool may read this canonical path.
+
+    Requires is_path_safe() AND not inside any FILE_SWARM_BLOCKED_DIRS
+    entry. Canonical (symlink-resolved) paths are used, so a symlink in
+    an allowed spot pointing at a blocked spot does not pass.
+    """
+    if not is_path_safe(path):
+        return False
+    canonical = _canonical_path(path)
+    return not any(
+        canonical == os.path.realpath(d) or _is_within(canonical, os.path.realpath(d))
+        for d in FILE_SWARM_BLOCKED_DIRS
+    )
+
+
 def is_command_safe(cmd: str) -> bool:
     """Check if command is safe to execute (blocklist only -- see note above)."""
     # Collapse runs of whitespace so "rm  -rf" cannot evade "rm -rf".
