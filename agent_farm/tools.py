@@ -214,18 +214,26 @@ def is_url_public(url: str) -> bool:
     return True
 
 
-def _http_request(method: str, url: str, body: str = "") -> Dict:
-    """Fetch a URL after SSRF validation, re-validating redirects."""
+def _http_request(method: str, url: str, body: str = "", headers: Optional[Dict] = None) -> Dict:
+    """Fetch a URL after SSRF validation, re-validating redirects.
+
+    This is the single HTTP path for both `http_get`/`http_post` and
+    `api_swarm` in server.py, so a swarm request cannot bypass the guard
+    by calling httpx directly. Only GET follows redirects, and each
+    redirect target is re-validated. Other methods return the redirect
+    response as-is rather than following it blindly.
+    """
+    method = (method or "GET").upper()
+    if method not in ("GET", "POST", "PUT", "DELETE"):
+        return {"url": url, "error": f"Unsupported method: {method}"}
     if not is_url_public(url):
         return {"url": url, "error": "Blocked URL: only public http/https URLs are allowed"}
     try:
         with httpx.Client(timeout=30.0, follow_redirects=False) as client:
             current_url = url
             for _ in range(4):
-                if method == "POST":
-                    resp = client.post(current_url, content=body)
-                else:
-                    resp = client.get(current_url)
+                resp = client.request(method, current_url, content=body,
+                                      headers=headers or {})
                 location = resp.headers.get("location")
                 if (method == "GET" and resp.status_code in (301, 302, 303, 307, 308)
                         and location):

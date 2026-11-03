@@ -41,6 +41,9 @@ Hardening added in this PR:
   command substitution (`$(...)`, backticks, `${...}`) is blocked.
 - **Tests and CI**: see Testing below. CI runs compile checks and pytest
   on push and pull requests to `main`.
+- **Swarm tools use the same guards**: `exec_swarm` now delegates to
+  `tool_exec_cmd` and `api_swarm` now delegates to the shared HTTP
+  helper, so neither can bypass the exec or SSRF guards above.
 
 ## Testing
 
