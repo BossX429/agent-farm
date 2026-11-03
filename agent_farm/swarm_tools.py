@@ -406,11 +406,18 @@ async def exec_swarm(commands: str) -> dict:
 
 
 @mcp.tool()
-async def api_swarm(requests: str) -> dict:
+async def api_swarm(requests: str, allow_mutating: bool = False) -> dict:
     """
     Execute parallel HTTP API requests.
     requests: JSON array of {url, method?, headers?, body?}
     Example: [{"url": "https://api.example.com/data"}, {"url": "...", "method": "POST", "body": "{}"}]
+    allow_mutating: False by default. When False, only GET requests
+    run; POST, PUT, and DELETE are blocked before any network call,
+    because SSRF checks alone do not stop a model from making a
+    destructive call to a public service. Pass allow_mutating=True
+    explicitly when a mutating call is intended. This is a per-call
+    opt-in, not a server-wide setting, so a single call cannot
+    silently enable mutating requests for later calls.
 
     This previously called httpx directly with no URL validation,
     bypassing the SSRF guard in tools.http_get/http_post. It now
@@ -431,6 +438,14 @@ async def api_swarm(requests: str) -> dict:
         method = req.get("method", "GET").upper()
         headers = req.get("headers", {}) or {}
         body = req.get("body") or ""
+        if method in ("POST", "PUT", "DELETE") and not allow_mutating:
+            return {
+                "url": url,
+                "method": method,
+                "error": "Mutating HTTP method blocked: api_swarm is GET-only by default. "
+                         "Pass allow_mutating=true to api_swarm to enable POST/PUT/DELETE.",
+                "status": "blocked",
+            }
         result = _http_request(method, url, body=body, headers=headers)
         if "error" in result:
             return {
