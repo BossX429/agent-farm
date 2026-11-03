@@ -1,7 +1,20 @@
 """
 Agent Farm Tool System v3.4 - Role-Based Tool Access
 Each bug role gets specific tools they can use.
-Speed optimized with expanded permissions.
+
+Security model (summary -- see README "Security model" for the full
+version): filesystem writes only inside an allowlist and reads
+blocked for system/sensitive paths (canonical, symlink-resolved);
+HTTP only to public http/https URLs, validated once and then
+connected to that exact validated IP (IP pinning), with redirects
+re-validated hop by hop; exec with no shell at all (simple commands
+or safe pipelines only); api_swarm GET-only unless a call explicitly
+opts into mutation; parallel work bounded by reliability.py limits.
+Escape hatches for local testing are OFF by default, are ignored
+entirely when AGENT_FARM_PRODUCTION=1, and their use is logged when
+action logging is enabled. This server is for local, trusted use
+only -- it is not a sandbox and must not be exposed to untrusted
+prompts, files, web pages, or other users.
 """
 
 import os
@@ -16,6 +29,7 @@ import subprocess
 import httpx
 from urllib.parse import urlparse, urljoin
 from typing import Dict, List, Any, Callable, Optional
+from .action_log import log_action, redact_url
 from dataclasses import dataclass
 
 # Role-specific tool permissions
@@ -373,15 +387,23 @@ def _is_non_public_ip(ip: "ipaddress._BaseAddress") -> bool:
 def _validate_url(url: str) -> Optional[Dict]:
     """Validate `url` and return its pinned connection info, or None.
 
-    Returns {"parsed": ..., "host": ..., "port": ..., "pinned_ip": ...}
-    on success. Scheme and credential checks are mandatory and run
-    before any escape hatch is consulted, so neither escape hatch can
-    turn a non-http(s) URL or a credential-bearing URL into an
-    allowed one. A hostname must resolve, and every address it
-    resolves to must be public unless a private-IP escape hatch
-    applies to this host -- otherwise a rotating answer could still
-    hand the connection a private address. The pinned IP is the first
-    resolved address.
+    Returns {"parsed": ..., "host": ..., "port": ..., "pinned_ip": ...,
+    "private_allowed": ...} on success. Scheme and credential checks
+    are mandatory and run before any escape hatch is consulted, so
+    neither escape hatch can turn a non-http(s) URL or a
+    credential-bearing URL into an allowed one. A hostname must
+    resolve, and every address it resolves to must be public unless
+    a private-IP escape hatch applies to this host -- otherwise a
+    rotating answer could still hand the connection a private
+    address. The pinned IP is the first resolved address.
+
+    Safe defaults: both escape hatches are OFF by default (the
+    allow-private flag only counts when it is exactly "1"), and
+    when AGENT_FARM_PRODUCTION=1 is set, BOTH escape hatches are
+    ignored entirely -- production mode cannot be talked out of
+    the private-IP rule by a leftover test setting. Use
+    escape_hatches_active() / get_security_config() to inspect
+    the current configuration.
     """
     try:
         parsed = urlparse(url)
@@ -395,9 +417,13 @@ def _validate_url(url: str) -> Optional[Dict]:
     host = (parsed.hostname or "").lower()
     if not host:
         return None
+    production_mode = os.environ.get("AGENT_FARM_PRODUCTION") == "1"
     private_allowed = (
-        os.environ.get("AGENT_FARM_ALLOW_PRIVATE_HTTP") == "1"
-        or host in _allowed_http_hosts()
+        not production_mode
+        and (
+            os.environ.get("AGENT_FARM_ALLOW_PRIVATE_HTTP") == "1"
+            or host in _allowed_http_hosts()
+        )
     )
     if (host in ("localhost",) or host.endswith((".localhost", ".local", ".internal"))) \
             and not private_allowed:
@@ -412,7 +438,8 @@ def _validate_url(url: str) -> Optional[Dict]:
         literal = ipaddress.ip_address(host)
         if _is_non_public_ip(literal) and not private_allowed:
             return None
-        return {"parsed": parsed, "host": host, "port": port, "pinned_ip": str(literal)}
+        return {"parsed": parsed, "host": host, "port": port, "pinned_ip": str(literal),
+                "private_allowed": private_allowed}
     except ValueError:
         pass
     try:
@@ -433,7 +460,43 @@ def _validate_url(url: str) -> Optional[Dict]:
             ips.append(str(ip))
     if not ips:
         return None
-    return {"parsed": parsed, "host": host, "port": port, "pinned_ip": ips[0]}
+    return {"parsed": parsed, "host": host, "port": port, "pinned_ip": ips[0],
+            "private_allowed": private_allowed}
+
+
+def escape_hatches_active():
+    """Return the local-testing escape hatches currently in effect.
+
+    Returns a list of names (possibly empty). In production mode
+    (AGENT_FARM_PRODUCTION=1) this always returns [] because both
+    hatches are ignored. Defaults are off, so an empty list is the
+    normal, safe state -- a non-empty list here is a visible signal
+    that this process is running in a relaxed local-testing mode
+    and must never be used for production.
+    """
+    if os.environ.get("AGENT_FARM_PRODUCTION") == "1":
+        return []
+    active = []
+    if os.environ.get("AGENT_FARM_ALLOW_PRIVATE_HTTP") == "1":
+        active.append("AGENT_FARM_ALLOW_PRIVATE_HTTP")
+    if _allowed_http_hosts():
+        active.append("AGENT_FARM_ALLOWED_HTTP_HOSTS")
+    return active
+
+
+def get_security_config():
+    """Return the current security configuration in plain terms."""
+    return {
+        "production_mode": os.environ.get("AGENT_FARM_PRODUCTION") == "1",
+        "allow_private_http": os.environ.get("AGENT_FARM_ALLOW_PRIVATE_HTTP") == "1",
+        "allowed_http_hosts": sorted(_allowed_http_hosts()),
+        "escape_hatches_active": escape_hatches_active(),
+        "http_rule": "public http/https only, IP-pinned, redirects re-validated",
+        "exec_rule": "no shell; simple commands or safe pipelines only",
+        "api_swarm_rule": "GET-only unless a call passes allow_mutating=True",
+        "write_rule": "writes only inside the write allowlist",
+        "trust": "local, trusted use only; not a sandbox",
+    }
 
 
 def is_url_public(url: str) -> bool:
@@ -547,17 +610,29 @@ def _http_request(method: str, url: str, body: str = "", headers: Optional[Dict]
         for _ in range(4):
             validated = _validate_url(current_url)
             if validated is None:
+                log_action("http_blocked", "blocked",
+                           f"blocked URL/redirect: {redact_url(current_url)}")
                 if current_url == url:
                     return {"url": url, "error": "Blocked URL: only public http/https URLs are allowed"}
                 return {"url": url, "error": "Blocked redirect to a non-public URL"}
+            if validated.get("private_allowed"):
+                log_action("http_escape_hatch", "allowed",
+                           "LOCAL TESTING ONLY: private-IP escape hatch used; "
+                           "never set in production")
             resp = _fetch_pinned(method, validated, body=body, headers=headers)
             location = resp["headers"].get("location")
             if (method == "GET" and resp["status"] in (301, 302, 303, 307, 308)
                     and location):
                 current_url = urljoin(current_url, location)
                 continue
-            return {"url": url, "status": resp["status"],
-                    "body": resp["body"][:MAX_OUTPUT]}
+            result = {"url": url, "status": resp["status"],
+                      "body": resp["body"][:MAX_OUTPUT]}
+            if validated.get("private_allowed"):
+                result["security_warning"] = (
+                    "LOCAL TESTING ONLY: a private-IP escape hatch was "
+                    "active for this request; never set it in production"
+                )
+            return result
         return {"url": url, "error": "Too many redirects"}
     except Exception as e:
         return {"error": str(e)}
@@ -574,6 +649,7 @@ def tool_read_file(path: str) -> Dict:
     """Read a file (with safety limits)"""
     path = _canonical_path(path)
     if not is_path_safe(path):
+        log_action("file_blocked", "blocked", f"blocked read path: {path}")
         return {"error": f"Blocked path: {path}"}
     try:
         with open(path, 'r') as f:
@@ -587,10 +663,12 @@ def tool_write_file(path: str, content: str) -> Dict:
     """Write to a file (with safety limits)"""
     path = _canonical_path(path)
     if not is_path_safe(path):
+        log_action("file_blocked", "blocked", f"blocked write path: {path}")
         return {"error": f"Blocked path: {path}"}
     # Only allow writing to safe directories (canonical/commonpath check:
     # "/tmpfoo" is not "/tmp", and symlinks out of the allowed dirs fail).
     if not is_write_path_allowed(path):
+        log_action("file_blocked", "blocked", f"blocked write outside allowlist: {path}")
         return {"error": f"Write only allowed in: {ALLOWED_WRITE_DIRS}"}
     try:
         with open(path, 'w') as f:
@@ -639,8 +717,13 @@ def tool_exec_cmd(cmd: str) -> Dict:
     privileges -- so run locally with trusted prompts only.
     """
     if "\n" in cmd or "\r" in cmd:
+        log_action("exec_blocked", "blocked", "blocked multi-line command")
         return {"error": "Blocked multi-line command"}
     if not is_command_safe(cmd):
+        # Log only the binary name, never the full command line --
+        # arguments may contain private content.
+        binary = (cmd.strip().split() or [""])[0][:80]
+        log_action("exec_blocked", "blocked", f"blocked command binary: {binary}")
         return {"error": "Blocked dangerous command pattern"}
     try:
         if _is_simple_command(cmd):
@@ -665,11 +748,14 @@ def tool_exec_cmd(cmd: str) -> Dict:
                 "stderr": result["stderr"],
                 "returncode": result["returncode"],
             }
+        binary = (cmd.strip().split() or [""])[0][:80]
+        log_action("exec_blocked", "blocked", f"blocked complex command binary: {binary}")
         return {"error": "Blocked complex shell command: only simple commands and "
                          "safe pipelines (stages joined by a single '|', no "
                          "redirection, chaining, substitution, or backgrounding) "
                          "are allowed"}
     except subprocess.TimeoutExpired:
+        log_action("exec_timeout", "timeout", f"command timed out ({EXEC_TIMEOUT}s)")
         return {"error": f"Command timed out ({EXEC_TIMEOUT}s)"}
     except Exception as e:
         return {"error": str(e)}
