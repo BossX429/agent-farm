@@ -304,7 +304,11 @@ def test_chunked_write_does_not_block_event_loop(monkeypatch, tmp_path):
         return result, ticks["n"]
 
     result, ticks = run(main())
-    assert result["status"] == "completed"
+    # chunked_write status is now validated/written_not_validated
+    # (Copilot roadmap #1, same vocabulary as chunked_code_gen),
+    # not the old "completed" -- this test is about loop responsiveness,
+    # not the status word, so accept either validated outcome.
+    assert result["status"] in ("validated", "written_not_validated")
     # If chunked_write blocked the loop for 0.3s, the ticker could not
     # have ticked at all; a responsive loop ticks many times.
     assert ticks >= 5
