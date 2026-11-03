@@ -44,6 +44,10 @@ Hardening added in this PR:
 - **Swarm tools use the same guards**: `exec_swarm` now delegates to
   `tool_exec_cmd` and `api_swarm` now delegates to the shared HTTP
   helper, so neither can bypass the exec or SSRF guards above.
+- **Server layout**: `server.py` is now a thin entrypoint. Tools live in
+  `state.py` (model tiers, colonies, stats), `ollama.py`, `colony.py`,
+  `colony_tools.py`, `swarm_tools.py`, and `chunked_tools.py`. The 25
+  MCP tool names are unchanged, and `server.py` re-exports them.
 
 ## Testing
 
