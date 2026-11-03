@@ -30,15 +30,24 @@ Hardening added in this PR:
 - **HTTP SSRF guard**: `http_get`/`http_post` now allow only public
   http/https URLs. Private, loopback, link-local, and metadata addresses
   (including `127.0.0.1` and `169.254.169.254`) are blocked, DNS failures
-  fail closed, and redirects are re-validated hop by hop. For local
-  testing only, `AGENT_FARM_ALLOW_PRIVATE_HTTP=1` or
-  `AGENT_FARM_ALLOWED_HTTP_HOSTS=host1,host2` can relax this. The internal
+  fail closed, and redirects are re-validated hop by hop. Each validated
+  URL is then connected to the exact IP that was validated (IP pinning),
+  with the original hostname kept for the Host header and, for https,
+  TLS certificate verification, so a DNS answer cannot change between
+  the check and the connection. For local testing only,
+  `AGENT_FARM_ALLOW_PRIVATE_HTTP=1` or
+  `AGENT_FARM_ALLOWED_HTTP_HOSTS=host1,host2` can relax ONLY the
+  private-IP rule; scheme validation and credential rejection still
+  apply, and allowed hosts must still resolve. The internal
   KMKB client (`127.0.0.1:8765`) does not go through these tools.
-- **Shell-free simple commands**: commands with no pipes, redirection,
-  chaining, or substitution now run with `shell=False`, so their arguments
-  cannot be interpreted as shell syntax. Complex shell commands still use
-  `shell=True` after the blocklist, multi-line commands are rejected, and
-  command substitution (`$(...)`, backticks, `${...}`) is blocked.
+- **No shell at all**: `exec_cmd` never runs a shell. Simple commands
+  run as argument lists, and the only complex form allowed is a safe
+  pipeline (stages joined by a single `|`, each stage an argument list,
+  max 5 stages). Chaining (`;`, `&&`, `||`), redirection (`>`, `<`),
+  substitution (`$(...)`, backticks, `${...}`), backgrounding (`&`),
+  and multi-line commands are rejected. This is a breaking change for
+  commands that relied on shell chaining or redirection: use separate
+  `exec_cmd` calls, and `write_file` instead of shell redirection.
 - **Tests and CI**: see Testing below. CI runs compile checks and pytest
   on push and pull requests to `main`.
 - **Swarm tools use the same guards**: `exec_swarm` now delegates to
@@ -60,6 +69,10 @@ Tests in `tests/test_tools.py` cover path safety and symlink traversal,
 write-allowlist prefix lookalikes, exec blocklist variants and
 shell-free execution, HTTP SSRF guards (with mocked DNS), tool-call
 parsing (JSON, quoted commas, parentheses), and ID uniqueness.
+Tests in `tests/test_chatgpt_top_security.py` cover the ChatGPT-review
+fixes: the private-HTTP override, DNS rebinding / IP pinning (including
+a local-server test where DNS flips after validation), and safe
+pipelines vs. rejected shell operators.
 
 ## Models
 
