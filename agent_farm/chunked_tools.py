@@ -13,6 +13,11 @@ from .mcp_app import mcp
 from .state import MODEL_TIERS, colonies, stats
 from .colony import spawn_colony_internal
 from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
+from .reliability import (
+    MODEL_TASK_TIMEOUT_SECONDS,
+    run_parallel,
+    validate_python_code,
+)
 
 
 # ============ CHUNKED WRITE PATTERN ============
@@ -111,6 +116,32 @@ Write the section content now:"""
     return content
 
 
+def _run_section_generation(sections: List[Dict], spec: str, num_sections: int) -> List[str]:
+    """Sync parallel section generation, run via asyncio.to_thread.
+
+    The caller is an async MCP tool: running this blocking parallel
+    work in a thread keeps the event loop free for other requests
+    while the model calls complete.
+    """
+    callables = [
+        (lambda s=sections[i], n=i + 1: generate_section_content(s, spec, n, num_sections))
+        for i in range(num_sections)
+    ]
+    results = run_parallel(
+        callables, max_workers=min(4, num_sections),
+        timeout=MODEL_TASK_TIMEOUT_SECONDS,
+    )
+    contents = []
+    for idx, result in enumerate(results):
+        if isinstance(result, str):
+            contents.append(result)
+        elif isinstance(result, dict):
+            contents.append(f"[Section {idx+1} generation failed: {result.get('error', 'unknown error')}]")
+        else:
+            contents.append(f"[Section {idx+1} generation failed: {result}]")
+    return contents
+
+
 @mcp.tool()
 async def chunked_write(
     output_path: str,
@@ -137,37 +168,20 @@ async def chunked_write(
     chunked_write("/tmp/report.md", "Analysis of Python best practices", 5)
     """
     import time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     start = time.time()
-    
+
     # Clamp sections
     num_sections = max(2, min(10, num_sections))
-    
-    # Step 1: Plan sections
-    sections = plan_sections(spec, num_sections)
-    
-    # Step 2: Generate sections in parallel
-    section_contents = [None] * num_sections
-    
-    with ThreadPoolExecutor(max_workers=min(4, num_sections)) as executor:
-        futures = {
-            executor.submit(
-                generate_section_content,
-                sections[i],
-                spec,
-                i + 1,
-                num_sections
-            ): i
-            for i in range(num_sections)
-        }
-        
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                section_contents[idx] = future.result()
-            except Exception as e:
-                section_contents[idx] = f"[Section {idx+1} generation failed: {str(e)}]"
-    
+
+    # Step 1: Plan sections -- a blocking model call, so run it in a
+    # thread instead of blocking the async event loop.
+    sections = await asyncio.to_thread(plan_sections, spec, num_sections)
+
+    # Step 2: Generate sections in parallel, also off the event loop.
+    section_contents = await asyncio.to_thread(
+        _run_section_generation, sections, spec, num_sections
+    )
+
     # Step 3: Concatenate directly (NO LLM)
     if doc_type == "markdown":
         header = f"# {spec}\n\n"
@@ -181,12 +195,12 @@ async def chunked_write(
     
     full_content = header + separator.join(section_contents)
     
-    # Step 4: Direct write (bypasses LLM)
+    # Step 4: Direct write (bypasses LLM), off the event loop.
     from .tools import tool_write_file
-    write_result = tool_write_file(output_path, full_content)
-    
+    write_result = await asyncio.to_thread(tool_write_file, output_path, full_content)
+
     elapsed = time.time() - start
-    
+
     return {
         "status": "completed" if "error" not in write_result else "failed",
         "output_path": output_path,
@@ -199,6 +213,54 @@ async def chunked_write(
         "write_result": write_result,
         "elapsed_seconds": round(elapsed, 2)
     }
+
+
+def _generate_function_sync(func: Dict, spec: str, language: str) -> str:
+    """Generate one function (sync, run via asyncio.to_thread)."""
+    from .agent import query_ollama_sync
+
+    prompt = f"""Write ONE {language} function:
+
+FUNCTION NAME: {func['title']}
+PURPOSE: {func['description']}
+CONTEXT: Part of a module for: {spec}
+
+RULES:
+- Write ONLY this one function
+- Include docstring/comments
+- Keep it focused and clean
+- Do NOT include imports (those go at top)
+- Do NOT include other functions
+
+Write the function now:"""
+    response = query_ollama_sync(MODEL_TIERS["worker"], prompt)
+    import re
+    content = response.strip()
+    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+    content = re.sub(r'```\w*\n?', '', content)
+    content = re.sub(r'```', '', content)
+    return content.strip()
+
+
+def _run_function_generation(functions: List[Dict], spec: str, language: str) -> List[str]:
+    """Sync parallel function generation, run via asyncio.to_thread."""
+    callables = [
+        (lambda f=functions[i]: _generate_function_sync(f, spec, language))
+        for i in range(len(functions))
+    ]
+    results = run_parallel(
+        callables, max_workers=min(4, len(functions)),
+        timeout=MODEL_TASK_TIMEOUT_SECONDS,
+    )
+    contents = []
+    for idx, result in enumerate(results):
+        if isinstance(result, str):
+            contents.append(result)
+        elif isinstance(result, dict):
+            contents.append(f"# Function {idx} generation failed: {result.get('error', 'unknown error')}")
+        else:
+            contents.append(f"# Function {idx} generation failed: {result}")
+    return contents
 
 
 @mcp.tool()
@@ -221,13 +283,12 @@ async def chunked_code_gen(
     chunked_code_gen("/tmp/utils.py", "File utilities: read, write, copy, delete", "python", 4)
     """
     import time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from .agent import query_ollama_sync, query_ollama_structured
+    from .agent import query_ollama_structured
     start = time.time()
-    
+
     num_functions = max(2, min(8, num_functions))
-    
-    # Step 1: Plan functions
+
+    # Step 1: Plan functions -- blocking model call, off the event loop.
     plan_prompt = f"""Plan {num_functions} functions for this code:
 
 SPECIFICATION: {spec}
@@ -239,60 +300,24 @@ Return JSON with "sections" array where each item has:
 
 Make functions logical and complementary."""
 
-    plan_response = query_ollama_structured(
+    plan_response = await asyncio.to_thread(
+        query_ollama_structured,
         MODEL_TIERS["learner"],
         plan_prompt,
-        SECTION_SCHEMA
+        SECTION_SCHEMA,
     )
-    
+
     functions = plan_response.get("sections", [])
     if len(functions) < num_functions:
         for i in range(len(functions), num_functions):
             functions.append({"title": f"helper_{i}", "description": "Helper function"})
     functions = functions[:num_functions]
-    
-    # Step 2: Generate functions in parallel
-    def generate_function(func: Dict, idx: int) -> str:
-        prompt = f"""Write ONE {language} function:
 
-FUNCTION NAME: {func['title']}
-PURPOSE: {func['description']}
-CONTEXT: Part of a module for: {spec}
+    # Step 2: Generate functions in parallel, off the event loop.
+    function_contents = await asyncio.to_thread(
+        _run_function_generation, functions, spec, language
+    )
 
-RULES:
-- Write ONLY this one function
-- Include docstring/comments
-- Keep it focused and clean
-- Do NOT include imports (those go at top)
-- Do NOT include other functions
-
-Write the function now:"""
-        
-        response = query_ollama_sync(MODEL_TIERS["worker"], prompt)
-        
-        # Clean up
-        import re
-        content = response.strip()
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
-        content = re.sub(r'```\w*\n?', '', content)
-        content = re.sub(r'```', '', content)
-        return content.strip()
-    
-    function_contents = [None] * num_functions
-    
-    with ThreadPoolExecutor(max_workers=min(4, num_functions)) as executor:
-        futures = {
-            executor.submit(generate_function, functions[i], i): i
-            for i in range(num_functions)
-        }
-        
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                function_contents[idx] = future.result()
-            except Exception as e:
-                function_contents[idx] = f"# Function {idx} generation failed: {str(e)}"
-    
     # Step 3: Assemble file (NO LLM)
     if language == "python":
         header = f'''"""
@@ -322,15 +347,49 @@ Auto-generated by Agent Farm chunked_code_gen
         separator = "\n\n"
     
     full_content = header + separator.join(function_contents)
-    
-    # Step 4: Write directly
+
+    # Step 4: Write directly, off the event loop.
     from .tools import tool_write_file
-    write_result = tool_write_file(output_path, full_content)
-    
+    write_result = await asyncio.to_thread(tool_write_file, output_path, full_content)
+
+    # Step 5: Mandatory validation, before declaring the code complete.
+    # "written" means the file was saved; "validated" additionally
+    # means it compiles with no duplicate top-level functions and no
+    # failed generation fragments. Validation never runs the code.
+    # Non-Python languages are not validated here, so they stay
+    # "written_not_validated" rather than being claimed as working.
+    if "error" in write_result:
+        validation = {
+            "syntax_ok": False,
+            "errors": ["Write failed; validation not run"],
+            "warnings": [],
+            "validated": False,
+            "function_names": [],
+            "function_count": 0,
+        }
+        status = "failed"
+    elif language == "python":
+        validation = await asyncio.to_thread(validate_python_code, full_content)
+        status = "validated" if validation["validated"] else "written_not_validated"
+    else:
+        validation = {
+            "syntax_ok": None,
+            "errors": [],
+            "warnings": [f"Validation is only implemented for python, not {language}"],
+            "validated": False,
+            "function_names": [f["title"] for f in functions],
+            "function_count": len(functions),
+        }
+        status = "written_not_validated"
+
     elapsed = time.time() - start
-    
+
     return {
-        "status": "completed" if "error" not in write_result else "failed",
+        "status": status,
+        "validation_status": "validated" if status == "validated" else (
+            "failed" if status == "failed" else "written_not_validated"
+        ),
+        "validation": validation,
         "output_path": output_path,
         "language": language,
         "spec": spec,
@@ -342,6 +401,50 @@ Auto-generated by Agent Farm chunked_code_gen
         "write_result": write_result,
         "elapsed_seconds": round(elapsed, 2)
     }
+
+
+def _analyze_perspective_sync(persp: Dict, target: str, question: str) -> Dict:
+    """One perspective analysis (sync, run via asyncio.to_thread)."""
+    from .agent import query_ollama_sync
+
+    prompt = f"""Analyze from the {persp['name']} perspective.
+
+TARGET: {target}
+QUESTION: {question}
+FOCUS ON: {persp['focus']}
+
+Provide a focused analysis (3-5 key points) from this perspective only.
+Be specific and actionable."""
+    response = query_ollama_sync(MODEL_TIERS["learner"], prompt)
+    import re
+    content = response.strip()
+    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+    return {
+        "perspective": persp["name"],
+        "focus": persp["focus"],
+        "analysis": content,
+    }
+
+
+def _run_perspective_analysis(perspectives: List[Dict], target: str, question: str) -> List[Dict]:
+    """Sync parallel perspective analysis, run via asyncio.to_thread."""
+    callables = [
+        (lambda p=p: _analyze_perspective_sync(p, target, question))
+        for p in perspectives
+    ]
+    results = run_parallel(
+        callables, max_workers=min(4, len(perspectives)),
+        timeout=MODEL_TASK_TIMEOUT_SECONDS,
+    )
+    analyses = []
+    for result in results:
+        if isinstance(result, dict) and "analysis" in result:
+            analyses.append(result)
+        elif isinstance(result, dict):
+            analyses.append({"perspective": "Error", "analysis": result.get("error", "unknown error")})
+        else:
+            analyses.append({"perspective": "Error", "analysis": str(result)})
+    return analyses
 
 
 @mcp.tool()
@@ -362,10 +465,8 @@ async def chunked_analysis(
     chunked_analysis("/home/kyle/repos/project", "What are the main architectural patterns?", 4)
     """
     import time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from .agent import query_ollama_sync
     start = time.time()
-    
+
     num_perspectives = max(2, min(6, num_perspectives))
     
     # Define analysis perspectives
@@ -378,44 +479,16 @@ async def chunked_analysis(
         {"name": "Maintainability", "focus": "readability, modularity, documentation"},
     ][:num_perspectives]
     
-    # Generate analyses in parallel
-    def analyze_perspective(persp: Dict) -> Dict:
-        prompt = f"""Analyze from the {persp['name']} perspective.
+    # Generate analyses in parallel, off the event loop.
+    analyses = await asyncio.to_thread(
+        _run_perspective_analysis, perspectives, target, question
+    )
 
-TARGET: {target}
-QUESTION: {question}
-FOCUS ON: {persp['focus']}
-
-Provide a focused analysis (3-5 key points) from this perspective only.
-Be specific and actionable."""
-        
-        response = query_ollama_sync(MODEL_TIERS["learner"], prompt)
-        
-        import re
-        content = response.strip()
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
-        
-        return {
-            "perspective": persp["name"],
-            "focus": persp["focus"],
-            "analysis": content
-        }
-    
-    analyses = []
-    
-    with ThreadPoolExecutor(max_workers=min(4, num_perspectives)) as executor:
-        futures = [executor.submit(analyze_perspective, p) for p in perspectives]
-        
-        for future in as_completed(futures):
-            try:
-                analyses.append(future.result())
-            except Exception as e:
-                analyses.append({"perspective": "Error", "analysis": str(e)})
-    
-    # Synthesize
-    synthesis = synthesize_swarm_results(
+    # Synthesize -- also a blocking model call, off the event loop.
+    synthesis = await asyncio.to_thread(
+        synthesize_swarm_results,
         [{"answer": a["analysis"], "role": a["perspective"]} for a in analyses],
-        task_context=f"Multi-perspective analysis of {target}: {question}"
+        task_context=f"Multi-perspective analysis of {target}: {question}",
     )
     
     elapsed = time.time() - start

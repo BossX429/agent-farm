@@ -17,6 +17,7 @@ from .colony import (
     entangle_colony,
 )
 from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
+from .reliability import validate_parallel_items, validate_parallel_payload
 
 
 # ============ MCP TOOLS ============
@@ -50,14 +51,21 @@ async def deploy_swarm(colony_id: str, tasks: str) -> dict:
         return {"error": f"Colony {colony_id} not found"}
     
     colony = colonies[colony_id]
-    
+
+    payload_error = validate_parallel_payload(tasks, "tasks")
+    if payload_error:
+        return {"error": payload_error}
     try:
         task_list = json.loads(tasks)
     except json.JSONDecodeError:
         # Single task as string
         task_list = [{"prompt": tasks}]
-    
-    results = execute_parallel_swarm(task_list, colony)
+
+    items_error = validate_parallel_items(task_list, "tasks")
+    if items_error:
+        return {"error": items_error}
+
+    results = await asyncio.to_thread(execute_parallel_swarm, task_list, colony)
     
     return {
         "colony_id": colony_id,
@@ -73,14 +81,21 @@ async def quick_swarm(tasks: str, colony_type: str = "fast") -> dict:
     One-shot: spawn colony + deploy swarm + return results
     tasks: JSON array or single prompt string
     """
+    payload_error = validate_parallel_payload(tasks, "tasks")
+    if payload_error:
+        return {"error": payload_error}
     colony = spawn_colony_internal(colony_type)
-    
+
     try:
         task_list = json.loads(tasks)
     except (json.JSONDecodeError, TypeError):
         task_list = [{"prompt": tasks}]
-    
-    results = execute_parallel_swarm(task_list, colony)
+
+    items_error = validate_parallel_items(task_list, "tasks")
+    if items_error:
+        return {"error": items_error}
+
+    results = await asyncio.to_thread(execute_parallel_swarm, task_list, colony)
     
     return {
         "colony_id": colony.id,

@@ -53,6 +53,28 @@ Hardening added in this PR:
 - **Swarm tools use the same guards**: `exec_swarm` now delegates to
   `tool_exec_cmd` and `api_swarm` now delegates to the shared HTTP
   helper, so neither can bypass the exec or SSRF guards above.
+- **Parallel reliability limits**: parallel tools (`exec_swarm`,
+  `api_swarm`, `file_swarm`, `kmkb_swarm`, `tool_swarm`,
+  `deploy_swarm`, `quick_swarm`) accept at most 32 items per request
+  and a 100,000-character payload; an empty or non-array list is
+  rejected instead of creating a zero-worker pool. Each task has a
+  per-task timeout, and total parallel output is capped at 50,000
+  characters (`output_truncated: true` when the cap bites). Model
+  calls are gated to at most 4 at once, shared across tools.
+- **Blocking work stays off the async event loop**: async tools run
+  blocking model, file, and swarm work in threads
+  (`asyncio.to_thread`), so one long model call does not stall
+  other requests. A per-task timeout means the caller stops waiting;
+  it does not kill a thread already running.
+- **Generated code is validated, not just written**:
+  `chunked_code_gen` for Python now compiles the assembled file and
+  reports duplicate top-level function names, syntax errors, and
+  failed generation fragments before declaring it complete. A result
+  of `validated` means it compiles cleanly; `written_not_validated`
+  means the file was saved but did not pass validation (or, for
+  non-Python languages, validation is not implemented). Validation
+  never runs the generated code, so it is not a claim that the code
+  was tested or is correct.
 - **Server layout**: `server.py` is now a thin entrypoint. Tools live in
   `state.py` (model tiers, colonies, stats), `ollama.py`, `colony.py`,
   `colony_tools.py`, `swarm_tools.py`, and `chunked_tools.py`. The 25
@@ -73,6 +95,12 @@ Tests in `tests/test_chatgpt_top_security.py` cover the ChatGPT-review
 fixes: the private-HTTP override, DNS rebinding / IP pinning (including
 a local-server test where DNS flips after validation), and safe
 pipelines vs. rejected shell operators.
+Tests in `tests/test_chatgpt_medium_reliability.py` cover the
+ChatGPT-review medium findings: parallel input limits and output
+caps, per-task timeouts, the shared model-concurrency gate, Python
+code validation (syntax, duplicates, possible missing imports),
+written-vs-validated code generation, and that a slow blocking
+planner does not stall the async event loop.
 
 ## Models
 

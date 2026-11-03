@@ -11,11 +11,12 @@ import re
 import httpx
 from typing import Dict, List, Optional, Any
 from .tools import (
-    get_tools_for_role, 
+    get_tools_for_role,
     get_tool_descriptions_for_role,
     execute_tool,
     TOOL_REGISTRY
 )
+from .reliability import MODEL_SEMAPHORE
 
 OLLAMA_URL = "http://localhost:11434"
 MAX_TOOL_ITERATIONS = 5
@@ -60,7 +61,7 @@ SIMPLE_TOOL_SCHEMA = {
 def query_ollama_sync(model: str, prompt: str) -> str:
     """Synchronous Ollama query - freeform text response"""
     try:
-        with httpx.Client() as client:
+        with MODEL_SEMAPHORE, httpx.Client() as client:
             resp = client.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={"model": model, "prompt": prompt, "stream": False},
@@ -88,9 +89,9 @@ def query_ollama_structured(model: str, prompt: str, schema: dict = None) -> Dic
     """
     if schema is None:
         schema = SIMPLE_TOOL_SCHEMA
-    
+
     try:
-        with httpx.Client() as client:
+        with MODEL_SEMAPHORE, httpx.Client() as client:
             resp = client.post(
                 f"{OLLAMA_URL}/api/chat",
                 json={
@@ -763,6 +764,19 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
         # Return early: ThreadPoolExecutor(max_workers=0) would raise.
         return results
 
+    if not bugs:
+        # No bugs to run tasks on: fail the tasks instead of crashing
+        # on an empty bug list or creating a zero-worker pool.
+        for task in bug_tasks:
+            results.append({
+                "bug_id": None,
+                "role": None,
+                "task": task.get("prompt", "")[:50] if isinstance(task, dict) else "",
+                "error": "No bugs available to run this task",
+                "status": "failed",
+            })
+        return results
+
     # Smart routing - match tasks to appropriate bugs
     bug_assignments = []
     used_bugs = set()
@@ -776,7 +790,7 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
         used_bugs.add(bug.id)
         bug_assignments.append((bug, task))
     
-    with ThreadPoolExecutor(max_workers=len(bugs)) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, min(len(bugs), 8))) as executor:
         futures = {
             executor.submit(
                 run_tool_agent,
