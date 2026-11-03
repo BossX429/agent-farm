@@ -19,14 +19,76 @@ Now with **Chunked Write Pattern** for generating large documents and code files
 
 ## Security
 
-This server runs shell commands (`exec_cmd`, `exec_swarm`) and file operations
-on the local machine. Its command/path checks are a blocklist and a set of
-path guards, **not a sandbox**: they reduce accidental damage but cannot make
-LLM-generated shell commands safe against untrusted input. Run it locally,
-with trusted prompts only, and do not expose it to untrusted files, web pages,
-or other users' prompts.
+This server runs commands (`exec_cmd`, `exec_swarm`) and file operations
+on the local machine. It is **not a sandbox**: allowed programs still run
+with the server's privileges, so it cannot make LLM-generated commands
+safe against untrusted input. Run it locally, with trusted prompts only,
+and do not expose it to untrusted files, web pages, or other users'
+prompts.
 
-Hardening added in this PR:
+## Security model
+
+The guards in place today, in one place:
+
+- **Filesystem**: reads are blocked for system/sensitive paths and
+  writes are allowed only inside `/tmp`, `/home/kyle/repos`, and
+  `/home/kyle/Desktop`. Paths are checked after resolving symlinks
+  and `..` components, so prefix look-alikes and symlink tricks do
+  not bypass them.
+- **HTTP / SSRF**: only public http/https URLs are fetched, each
+  validated once and then connected to that exact validated IP
+  (IP pinning), with redirects re-validated hop by hop. URLs with
+  login details in them are always rejected.
+- **Exec**: no shell at all. Only simple commands (argument lists)
+  or safe pipelines (stages joined by a single `|`, max 5 stages)
+  run. Chaining, redirection, substitution, and backgrounding are
+  rejected. A command blocklist remains only as defence-in-depth.
+- **api_swarm**: GET-only by default. POST/PUT/DELETE need an
+  explicit per-call `allow_mutating=True`; there is no server-wide
+  flag that silently enables mutation for later calls. Making
+  mutation structurally impossible would break this tool's intended
+  purpose (calling APIs), so the safe default + per-call opt-in +
+  action logging is the design instead.
+- **Parallel work**: at most 32 items per request, 100,000-character
+  payloads, 50,000-character aggregate output, per-task timeouts,
+  and at most 4 simultaneous model calls.
+- **Generated code**: `chunked_code_gen` for Python compiles and
+  checks the assembled file and reports `validated` or
+  `written_not_validated`; validation never runs the code, so it
+  is not a claim the code was tested or is correct.
+
+## Deployment: safe defaults
+
+- Defaults are deny/off: private-HTTP escape hatches are off unless
+  explicitly set, and `api_swarm` mutation is off unless explicitly
+  passed per call.
+- Local testing only, **never in production**:
+  `AGENT_FARM_ALLOW_PRIVATE_HTTP=1` and
+  `AGENT_FARM_ALLOWED_HTTP_HOSTS=host1,host2` relax *only* the
+  private-IP rule; scheme and credential checks still apply, and
+  allowed hosts must still resolve.
+- Set `AGENT_FARM_PRODUCTION=1` in any production-like deployment:
+  it ignores both escape hatches entirely, even if a test setting
+  was left in the environment.
+- Use `tools.get_security_config()` to inspect the current
+  configuration, and `tools.escape_hatches_active()` to see
+  whether any escape hatch is currently in effect.
+
+## Action log (structured, opt-in)
+
+Set `AGENT_FARM_ACTION_LOG=/path/to/actions.jsonl` (or `=1` for
+`./agent-farm-actions.jsonl`) to record one JSON object per line
+for enforcement events: blocked paths, blocked URLs, blocked
+commands, blocked/allowed mutating API calls, timeouts, and code
+validation outcomes. It never logs message bodies, file contents,
+generated code, full command lines (binary name only), or URLs
+with credentials (those are redacted). Each record carries a
+SHA-256 hash chain (`prev_hash` / `hash`); `action_log.verify_action_log(path)`
+detects a single record edited in place. That is **not**
+tamper-proofing: anyone with write access to the log file could
+rewrite the whole chain. The log is off by default.
+
+Hardening in place:
 - **HTTP SSRF guard**: `http_get`/`http_post` now allow only public
   http/https URLs. Private, loopback, link-local, and metadata addresses
   (including `127.0.0.1` and `169.254.169.254`) are blocked, DNS failures
