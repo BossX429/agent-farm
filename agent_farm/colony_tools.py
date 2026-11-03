@@ -10,6 +10,7 @@ from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .mcp_app import mcp
+from .metrics import track_tool_run
 from .state import MODEL_TIERS, OLLAMA_URL, colonies, stats
 from .colony import (
     spawn_colony_internal,
@@ -23,6 +24,7 @@ from .reliability import validate_parallel_items, validate_parallel_payload
 # ============ MCP TOOLS ============
 
 @mcp.tool()
+@track_tool_run()
 async def spawn_colony(colony_type: str = "standard") -> dict:
     """
     Spawn a new bug colony. Types: standard, fast, heavy, hybrid
@@ -41,6 +43,7 @@ async def spawn_colony(colony_type: str = "standard") -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def deploy_swarm(colony_id: str, tasks: str) -> dict:
     """
     Deploy swarm for parallel task execution.
@@ -76,6 +79,7 @@ async def deploy_swarm(colony_id: str, tasks: str) -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def quick_swarm(tasks: str, colony_type: str = "fast") -> dict:
     """
     One-shot: spawn colony + deploy swarm + return results
@@ -157,6 +161,7 @@ async def colony_status(colony_id: str) -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def quick_colony() -> dict:
     """
     Quick status check - ONE CALL for colony health
@@ -243,9 +248,18 @@ async def farm_stats() -> dict:
         "model_tiers": MODEL_TIERS,
         # Copilot roadmap #3 (metrics) and #4 (observability):
         # per-tool counts/durations/validation outcomes, plus the
-        # action-log summary. Metrics cover chunked tools in this
-        # change; other swarms can record_tool_run() to appear here.
+        # action-log summary. Metrics now cover chunked tools (with
+        # validation outcomes) and swarm/colony tools (via the
+        # track_tool_run decorator, counts and durations only).
+        # Read-only tools (list_colonies, colony_status, farm_stats
+        # itself) are not counted, so "metrics" is a tool-run record,
+        # not a count of every MCP call.
         "metrics": get_metrics(),
+        "metrics_coverage": (
+            "chunked tools with validation outcomes; "
+            "swarm and colony tools with counts/durations only; "
+            "read-only tools not counted"
+        ),
         "observability": {
             "action_log": _action_log_summary(),
         },
@@ -253,6 +267,7 @@ async def farm_stats() -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def dissolve_colony(colony_id: str) -> dict:
     """Dissolve a colony and free resources"""
     if colony_id not in colonies:
@@ -268,6 +283,7 @@ async def dissolve_colony(colony_id: str) -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def cleanup_idle() -> dict:
     """Remove all colonies with 0 tasks completed"""
     idle = [cid for cid, c in colonies.items() if c.tasks_completed == 0]
