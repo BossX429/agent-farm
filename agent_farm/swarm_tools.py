@@ -10,6 +10,7 @@ from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .mcp_app import mcp
+from .metrics import track_tool_run
 from .state import MODEL_TIERS, OLLAMA_URL, colonies, stats
 from .colony import (
     _unique_id,
@@ -34,6 +35,7 @@ from .reliability import (
 
 
 @mcp.tool()
+@track_tool_run()
 async def code_review_swarm(code: str, filepath: str = "") -> dict:
     """
     Run parallel code review with 4 specialized perspectives.
@@ -183,6 +185,7 @@ REFACTORING SUGGESTIONS:"""
 # ============ EXECUTION SWARMS ============
 
 @mcp.tool()
+@track_tool_run()
 async def code_gen_swarm(spec: str, language: str = "python") -> dict:
     """
     Generate code from spec with 4 parallel perspectives.
@@ -275,6 +278,7 @@ EXAMPLES:"""
 
 
 @mcp.tool()
+@track_tool_run()
 async def file_swarm(operations: str) -> dict:
     """
     Execute parallel file operations.
@@ -395,6 +399,7 @@ async def file_swarm(operations: str) -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def exec_swarm(commands: str) -> dict:
     """
     Execute commands in parallel (no shell at all; with safety checks).
@@ -466,6 +471,7 @@ async def exec_swarm(commands: str) -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def api_swarm(requests: str, allow_mutating: bool = False) -> dict:
     """
     Execute parallel HTTP API requests.
@@ -569,6 +575,7 @@ async def api_swarm(requests: str, allow_mutating: bool = False) -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def kmkb_swarm(queries: str, synthesize: bool = True) -> dict:
     """
     Query KMKB from multiple angles in parallel, optionally synthesize.
@@ -674,6 +681,7 @@ SYNTHESIS (be concise, extract key insights):"""
 # ============ TOOL-ENABLED AGENTS ============
 
 @mcp.tool()
+@track_tool_run()
 async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False, synthesize: bool = False) -> dict:
     """
     Deploy tool-enabled agents that can use real system tools.
@@ -778,6 +786,7 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
 
 
 @mcp.tool()
+@track_tool_run()
 async def system_health_swarm(synthesize: bool = True) -> dict:
     """
     Quick system health check using tool-enabled bugs.
@@ -829,6 +838,7 @@ async def system_health_swarm(synthesize: bool = True) -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def recon_swarm(target_path: str, deep: bool = False, synthesize: bool = True) -> dict:
     """
     Reconnaissance swarm - scouts explore a directory/codebase.
@@ -880,6 +890,7 @@ async def recon_swarm(target_path: str, deep: bool = False, synthesize: bool = T
 
 
 @mcp.tool()
+@track_tool_run()
 async def worker_task(task: str, context: str = "") -> dict:
     """
     Single worker bug with tools to complete a task.
@@ -914,6 +925,7 @@ async def worker_task(task: str, context: str = "") -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def heavy_write(path: str, content: str) -> dict:
     """
     Direct file write - NO LLM involved. Use for large content.
@@ -946,6 +958,7 @@ async def heavy_write(path: str, content: str) -> dict:
 
 
 @mcp.tool()
+@track_tool_run()
 async def deep_analysis_swarm(target_path: str, analysis_type: str = "full", synthesize: bool = True) -> dict:
     """
     Deep analysis swarm using WORKERS with exec_cmd for thorough system analysis.
@@ -1025,6 +1038,7 @@ async def deep_analysis_swarm(target_path: str, analysis_type: str = "full", syn
 
 
 @mcp.tool()
+@track_tool_run()
 async def synthesize(results: str, context: str = "") -> dict:
     """
     Standalone synthesis tool - synthesize any JSON results into unified summary.

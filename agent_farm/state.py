@@ -18,7 +18,9 @@ OLLAMA_URL = "http://localhost:11434"
 
 # Model tiers - optimized for 7900 XTX 24GB VRAM
 # ALL models must be capable of following tool format
-# Using qwen3:4b across the board for consistency
+# Workers/scouts/memory/guardians use qwen3:4b for consistency;
+# the synthesizer deliberately uses qwen2.5:14b (8.99GB) for
+# accuracy on result synthesis, so it is NOT a 4b tier.
 MODEL_TIERS = {
     "scout": "qwen3:4b",       # 2.5GB - reconnaissance
     "worker": "qwen3:4b",      # 2.5GB - task execution

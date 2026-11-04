@@ -251,6 +251,36 @@ _GENERATION_FAILED_RE = re.compile(r"generation failed", re.IGNORECASE)
 _BUILTINS = set(dir(builtins))
 
 
+def _has_bare_error_fragment(content: str) -> bool:
+    """True if a worker error marker sits outside any code or string.
+
+    A worker that fails (for example a model call timing out) may return
+    a plain line such as ``Error: timed out`` instead of a function.
+    When that line is spliced into a generated file before the first
+    function definition, it is not a function at all -- it is a failed
+    fragment, even if the file still happens to parse (for example if
+    the marker lands inside a comment, or as a bare string). Only lines
+    before the first top-level ``def``/``class`` are checked, and lines
+    inside a triple-quoted string are skipped, so a legitimate
+    docstring that mentions an error is not flagged.
+    """
+    in_string = None  # "'''" or '"""' when inside a triple-quoted string
+    for line in content.splitlines():
+        stripped = line.strip()
+        # Track triple-quoted strings so their contents are not scanned.
+        if in_string is None:
+            if stripped.startswith(("def ", "class ")):
+                return False
+            marker = stripped.lstrip("# ").strip()
+            if marker.startswith("Error:") or marker.startswith("Error -"):
+                return True
+        # Toggle triple-quote state, counting occurrences on this line.
+        for quote in ("'''", '"""'):
+            if line.count(quote) % 2 == 1:
+                in_string = None if in_string == quote else quote
+    return False
+
+
 def _collect_defined_names(tree: ast.AST) -> set:
     defined = set()
     for node in ast.walk(tree):
@@ -328,9 +358,14 @@ def validate_python_code(content: str) -> Dict[str, Any]:
         compile(content, "<generated>", "exec")
         syntax_ok = True
     except SyntaxError as exc:
+        syntax_errors = [f"Syntax error at line {exc.lineno}: {exc.msg}"]
+        if _has_bare_error_fragment(content):
+            syntax_errors.append(
+                "One or more functions failed to generate (worker error marker found)"
+            )
         return {
             "syntax_ok": False,
-            "errors": [f"Syntax error at line {exc.lineno}: {exc.msg}"],
+            "errors": syntax_errors,
             "warnings": [],
             "validated": False,
             "function_names": [],
@@ -350,6 +385,8 @@ def validate_python_code(content: str) -> Dict[str, Any]:
         errors.append(f"Duplicate function name: {name}")
     if _GENERATION_FAILED_RE.search(content):
         errors.append("One or more functions failed to generate")
+    if _has_bare_error_fragment(content):
+        errors.append("One or more functions failed to generate (worker error marker found)")
 
     defined = _collect_defined_names(tree)
     used = _collect_used_root_names(tree)
@@ -390,6 +427,8 @@ def _is_failed_fragment(text: str) -> bool:
     stripped = text.strip()
     return (
         not stripped
+        or stripped.startswith("Error:")
+        or stripped.startswith("Error -")
         or stripped.startswith("[Section ")
         and "generation failed" in stripped
         or stripped.startswith("# Function ")
