@@ -21,15 +21,24 @@ used from both sync and async code without importing the MCP app:
   in :func:`validate_python_code`. Validation is a compile/AST check,
   not a test run: a validated file compiles, has no duplicate
   top-level function names, and has no failed generation fragments.
-  Possible missing imports are reported as warnings, not hard errors,
-  because static name analysis cannot know every name a caller will
-  provide (for example names imported by the surrounding module).
+  It also now checks, with a scope-aware name analysis
+  (:func:`find_undefined_names`), that every non-module name the code
+  *uses* is actually *defined* somewhere in the file -- a function
+  that appends to a global list that was never created, for example,
+  would crash with ``NameError`` the first time it runs, even though
+  it compiles cleanly. Possible missing imports are still reported
+  as warnings, not hard errors, because a missing import is a
+  one-line fix and the name could be supplied by the caller.
+  Validation still never *executes* the generated code: running it
+  would let a bad or malicious worker's top-level statements run
+  with the server's privileges, so the check stays static.
 """
 
 import asyncio
 import ast
 import builtins
 import re
+import symtable
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -326,13 +335,88 @@ def _collect_used_root_names(tree: ast.AST) -> set:
     return used
 
 
+# Names that look like they were meant as modules, used as a root
+# (e.g. json.dumps). A use of one of these with no import is a
+# possible missing import, reported as a warning, not an error.
+_KNOWN_MODULE_ROOTS = {
+    "json", "os", "sys", "re", "math", "random", "datetime",
+    "time", "pathlib", "collections", "itertools", "functools",
+    "typing", "io", "subprocess", "httpx", "requests",
+}
+
+
+def find_undefined_names(content: str) -> List[str]:
+    """Return names a generated file uses but never defines or imports.
+
+    Scope-aware, using :mod:`symtable` (Python's own symbol-table
+    analysis) rather than a flat defined/used set: a name that is an
+    argument in one function does *not* count as defined in another
+    function, and a name captured from an enclosing function (a
+    closure) does count. That distinction matters -- it is exactly
+    what the flat check missed in the hard GPU test, where
+    ``search_tasks(tasks, ...)`` made ``tasks`` look defined even
+    though ``add_task`` appends to a global ``tasks`` that the file
+    never creates.
+
+    Names that are builtins, ``self``/``cls``, or known module roots
+    are excluded: builtins and ``self``/``cls`` are always available,
+    and a missing module import is reported as a warning by
+    :func:`validate_python_code`, not as an undefined name here.
+
+    Returns ``[]`` when the code does not parse -- the syntax check
+    already reports that case. This is a static check only; the code
+    is never executed.
+    """
+    try:
+        table = symtable.symtable(content, "<generated>", "exec")
+    except (SyntaxError, ValueError):
+        return []
+    module_defined = {
+        sym.get_name()
+        for sym in table.get_symbols()
+        if sym.is_assigned() or sym.is_imported()
+    }
+    undefined: set = set()
+
+    def _walk(sym_table) -> None:
+        for sym in sym_table.get_symbols():
+            name = sym.get_name()
+            if not sym.is_referenced():
+                continue
+            if name in _BUILTINS or name in {"self", "cls"}:
+                continue
+            if name in _KNOWN_MODULE_ROOTS:
+                continue
+            # Local to this scope, a parameter, a closure variable, or
+            # assigned/imported here: defined, not undefined.
+            if (
+                sym.is_local()
+                or sym.is_parameter()
+                or sym.is_free()
+                or sym.is_imported()
+                or sym.is_assigned()
+            ):
+                continue
+            # A global reference is defined only if the module itself
+            # assigns or imports the name.
+            if name not in module_defined:
+                undefined.add(name)
+        for child in sym_table.get_children():
+            _walk(child)
+
+    _walk(table)
+    return sorted(undefined)
+
+
 def validate_python_code(content: str) -> Dict[str, Any]:
     """Validate generated Python code without running it.
 
     Returns a dict with:
     - ``syntax_ok``: False if the code does not parse/compile.
     - ``errors``: hard problems (syntax errors, duplicate top-level
-      function names, failed generation fragments).
+      function names, failed generation fragments, and names the code
+      uses but never defines or imports -- see
+      :func:`find_undefined_names`).
     - ``warnings``: possible missing imports (heuristic, see module
       docstring) and other non-fatal notes.
     - ``validated``: True only when there are no errors.
@@ -340,7 +424,8 @@ def validate_python_code(content: str) -> Dict[str, Any]:
 
     Validation is deliberately *not* execution: generated code is
     never run as part of validation, so a validated file is known to
-    compile, not known to be correct or tested.
+    compile and to have no undefined names, not known to be correct
+    or tested.
     """
     if not isinstance(content, str) or not content.strip():
         return {
@@ -399,16 +484,18 @@ def validate_python_code(content: str) -> Dict[str, Any]:
     )
     # Only flag names that look like they were meant as modules or
     # known stdlib helpers used as a root (e.g. json/os/sys/re) -- a
-    # bare name like ``helper`` could be supplied by the caller, so do
-    # not flag arbitrary unknown names as missing imports.
-    _KNOWN_MODULE_ROOTS = {
-        "json", "os", "sys", "re", "math", "random", "datetime",
-        "time", "pathlib", "collections", "itertools", "functools",
-        "typing", "io", "subprocess", "httpx", "requests",
-    }
+    # missing import is a warning, not an error (see the module
+    # docstring). Every other used-but-never-defined name is an
+    # error: the generated file is meant to stand alone, so a
+    # function that uses a name nothing in the file defines would
+    # crash with NameError the first time it runs.
     for name in possible_missing:
         if name in _KNOWN_MODULE_ROOTS:
             warnings.append(f"Possible missing import: {name}")
+    for name in find_undefined_names(content):
+        errors.append(
+            f"Undefined name: {name} (used but never defined or imported)"
+        )
 
     return {
         "syntax_ok": syntax_ok,

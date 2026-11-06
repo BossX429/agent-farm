@@ -355,7 +355,9 @@ async def file_swarm(operations: str) -> dict:
                 return {"action": action, "path": raw_path, "bytes": result["bytes_written"], "status": "success"}
             elif action == "append":
                 path = _canonical_path(raw_path)
-                with open(path, 'a') as f:
+                # Explicit UTF-8, matching tool_write_file: without
+                # this, Windows appends in cp1252.
+                with open(path, 'a', encoding='utf-8') as f:
                     f.write(content)
                 return {"action": action, "path": raw_path, "bytes": len(content), "status": "success"}
             elif action == "exists":
