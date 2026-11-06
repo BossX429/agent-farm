@@ -652,7 +652,11 @@ def tool_read_file(path: str) -> Dict:
         log_action("file_blocked", "blocked", f"blocked read path: {path}")
         return {"error": f"Blocked path: {path}"}
     try:
-        with open(path, 'r') as f:
+        # Explicit UTF-8: the platform default is UTF-8 on Linux but
+        # cp1252 on Windows, so a file written on one side could not
+        # be read back as text on the other (smart punctuation came
+        # back as replacement characters / invalid UTF-8 bytes).
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read(MAX_FILE_SIZE)
         return {"path": path, "content": content, "truncated": len(content) >= MAX_FILE_SIZE}
     except Exception as e:
@@ -671,7 +675,10 @@ def tool_write_file(path: str, content: str) -> Dict:
         log_action("file_blocked", "blocked", f"blocked write outside allowlist: {path}")
         return {"error": f"Write only allowed in: {ALLOWED_WRITE_DIRS}"}
     try:
-        with open(path, 'w') as f:
+        # Explicit UTF-8 (see tool_read_file): without this, Windows
+        # writes text in cp1252, so smart quotes/dashes in model
+        # output became bytes that are not valid UTF-8 on read-back.
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(content)
         return {"path": path, "bytes_written": len(content), "status": "success"}
     except Exception as e:
