@@ -13,16 +13,23 @@ What is tracked, per tool name:
 - validations: how many runs ended validated / written_not_validated
   / failed (only tools that report a validation status fill this in)
 
+What is tracked, per bug id (profiler factory Phase 1):
+- calls, successes, failures, total_seconds and avg_seconds for
+  each bug in a parallel swarm run, with the bug's role and model,
+  so a later phase can group timings by bug. Only elapsed time
+  and success/failure are recorded: no token cost, no quality
+  score, and no content of any kind.
+
 What is NOT tracked, on purpose:
 - Token cost. Ollama responses here do not report token counts in a
   uniform way, so a token-cost number would be invented. If a future
   Ollama client returns prompt/eval token counts, add them here as
   real counts, not estimates.
-- Per-agent (per-bug) attribution for parallel swarms. Chunked tools
-  run several worker bugs in a thread pool and return aggregated
-  results, so the honest unit here is the tool run, not a single bug.
-  A future per-bug tracker can build on this module once swarm
-  results carry a bug id.
+- Per-bug attribution for chunked tools. Chunked tools run several
+  worker bugs in a thread pool and return aggregated results, so the
+  honest unit there is still the tool run, not a single bug.
+  Per-bug timing exists only where a swarm result already carries
+  a bug id (see record_bug_run).
 
 Metrics live only in this process and reset on restart, like the
 colonies themselves. They are exposed through farm_stats(), not a
@@ -36,6 +43,7 @@ from typing import Any, Dict, Optional
 
 _LOCK = threading.Lock()
 _DATA: Dict[str, Dict[str, Any]] = {}
+_BUG_DATA: Dict[str, Dict[str, Any]] = {}
 
 
 def _entry(tool: str) -> Dict[str, Any]:
@@ -97,10 +105,78 @@ def get_metrics() -> Dict[str, Dict[str, Any]]:
         return result
 
 
+def _bug_entry(bug_id: str, role: Optional[str], model: Optional[str]) -> Dict[str, Any]:
+    entry = _BUG_DATA.setdefault(bug_id, {
+        "role": role,
+        "model": model,
+        "calls": 0,
+        "successes": 0,
+        "failures": 0,
+        "total_seconds": 0.0,
+    })
+    return entry
+
+
+def record_bug_run(
+    bug_id: str,
+    elapsed_seconds: float,
+    success: bool,
+    role: Optional[str] = None,
+    model: Optional[str] = None,
+) -> None:
+    """Record one completed run for a single bug. Never raises on bad input.
+
+    This is the profiler factory Phase 1 store: it only counts what a
+    swarm result already carries (bug id, role, model, elapsed time,
+    success/failure). It never calls a model and never logs content.
+    A bug id is unique to one colony spawn, so a later phase groups
+    these runs by role and model, not by bug id alone.
+    """
+    try:
+        if not bug_id:
+            return
+        elapsed = float(elapsed_seconds or 0.0)
+    except (TypeError, ValueError):
+        return
+    with _LOCK:
+        entry = _bug_entry(str(bug_id), role, model)
+        entry["calls"] += 1
+        if success:
+            entry["successes"] += 1
+        else:
+            entry["failures"] += 1
+        entry["total_seconds"] += max(0.0, elapsed)
+
+
+def get_bug_metrics() -> Dict[str, Dict[str, Any]]:
+    """Return a copy of all per-bug metrics, with avg_seconds computed."""
+    with _LOCK:
+        result = {}
+        for bug_id, entry in _BUG_DATA.items():
+            calls = entry["calls"]
+            result[bug_id] = {
+                "role": entry["role"],
+                "model": entry["model"],
+                "calls": calls,
+                "successes": entry["successes"],
+                "failures": entry["failures"],
+                "total_seconds": round(entry["total_seconds"], 2),
+                "avg_seconds": round(entry["total_seconds"] / calls, 2) if calls else 0.0,
+            }
+        return result
+
+
+def reset_bug_metrics() -> None:
+    """Clear per-bug metrics only. Used by tests; not an MCP tool."""
+    with _LOCK:
+        _BUG_DATA.clear()
+
+
 def reset_metrics() -> None:
-    """Clear all metrics. Used by tests; not an MCP tool."""
+    """Clear all metrics (tool and per-bug). Used by tests; not an MCP tool."""
     with _LOCK:
         _DATA.clear()
+        _BUG_DATA.clear()
 
 
 def track_tool_run(tool_name=None):

@@ -19,6 +19,7 @@ from .state import (
     stats,
 )
 from .ollama import sync_query_ollama
+from .metrics import record_bug_run
 
 
 def _unique_id(prefix: str) -> str:
@@ -150,11 +151,16 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
             prompt = task.get("prompt", "")
             context = task.get("context", "")
             full_prompt = f"Context: {context}\n\nTask: {prompt}" if context else prompt
+            started = time.time()
             future = executor.submit(sync_query_ollama, bug.model, full_prompt)
-            futures[future] = (bug, task)
-        
+            futures[future] = (bug, task, started)
+
         for future in as_completed(futures):
-            bug, task = futures[future]
+            bug, task, started = futures[future]
+            # Profiler factory Phase 1: per-bug elapsed time and status.
+            # This only records what the run already knows; it does not
+            # change which bug was picked or what the bug returns.
+            elapsed_seconds = round(time.time() - started, 2)
             try:
                 response = future.result()
                 results.append({
@@ -163,17 +169,22 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                     "model": bug.model,
                     "task": task.get("prompt", "")[:50],
                     "response": response,
-                    "status": "success"
+                    "status": "success",
+                    "elapsed_seconds": elapsed_seconds,
                 })
+                record_bug_run(bug.id, elapsed_seconds, True, role=bug.role, model=bug.model)
                 bug.status = "completed"
                 bug.last_task = task.get("prompt", "")[:50]
             except Exception as e:
                 results.append({
                     "bug_id": bug.id,
                     "role": bug.role,
+                    "model": bug.model,
                     "error": str(e),
-                    "status": "failed"
+                    "status": "failed",
+                    "elapsed_seconds": elapsed_seconds,
                 })
+                record_bug_run(bug.id, elapsed_seconds, False, role=bug.role, model=bug.model)
     
     elapsed = time.time() - start
     colony.tasks_completed += len(tasks)
