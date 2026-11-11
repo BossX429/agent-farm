@@ -1,33 +1,33 @@
 {
-  "avg_seconds": 29.73,
+  "avg_seconds": 20.29,
   "best_task_types": [
-    "list",
     "write",
+    "list",
     "check",
-    "analyze",
-    "search"
+    "search",
+    "analyze"
   ],
   "failure_modes": {},
   "failures": 0,
-  "last_updated": "2026-11-11T01:26:20.833522+00:00",
+  "last_updated": "2026-11-11T01:35:05.751425+00:00",
   "model": "qwen3:4b",
   "per_task_type": {
     "analyze": {
-      "avg_seconds": 38.12,
+      "avg_seconds": 22.98,
       "failures": 0,
       "samples": 1,
       "success_rate": 1.0,
       "successes": 1,
-      "total_seconds": 38.125,
+      "total_seconds": 22.98399999999674,
       "trusted": false
     },
     "check": {
-      "avg_seconds": 30.19,
+      "avg_seconds": 20.91,
       "failures": 0,
       "samples": 1,
       "success_rate": 1.0,
       "successes": 1,
-      "total_seconds": 30.18699999997625,
+      "total_seconds": 20.90600000001723,
       "trusted": false
     },
     "general": {
@@ -40,30 +40,30 @@
       "trusted": false
     },
     "list": {
-      "avg_seconds": 14.72,
+      "avg_seconds": 19.16,
       "failures": 0,
       "samples": 1,
       "success_rate": 1.0,
       "successes": 1,
-      "total_seconds": 14.71899999998277,
+      "total_seconds": 19.15600000001723,
       "trusted": false
     },
     "search": {
-      "avg_seconds": 38.81,
+      "avg_seconds": 22.44,
       "failures": 0,
       "samples": 1,
       "success_rate": 1.0,
       "successes": 1,
-      "total_seconds": 38.81300000002375,
+      "total_seconds": 22.43800000002375,
       "trusted": false
     },
     "write": {
-      "avg_seconds": 26.81,
+      "avg_seconds": 15.97,
       "failures": 0,
       "samples": 1,
       "success_rate": 1.0,
       "successes": 1,
-      "total_seconds": 26.81200000003446,
+      "total_seconds": 15.96899999998277,
       "trusted": false
     }
   },
@@ -73,13 +73,13 @@
   "stale_reason": null,
   "success_rate": 1.0,
   "successes": 5,
-  "total_seconds": 148.65600000001723,
+  "total_seconds": 101.45300000003772,
   "trusted": false,
   "worst_task_types": [
-    "search",
     "analyze",
+    "search",
     "check",
-    "write",
-    "list"
+    "list",
+    "write"
   ]
 }
