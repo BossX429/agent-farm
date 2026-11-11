@@ -1,0 +1,85 @@
+{
+  "avg_seconds": 22.3,
+  "best_task_types": [
+    "list",
+    "check",
+    "search",
+    "write",
+    "analyze"
+  ],
+  "failure_modes": {},
+  "failures": 0,
+  "last_updated": "2026-11-11T01:34:35.313267+00:00",
+  "model": "qwen3:4b",
+  "per_task_type": {
+    "analyze": {
+      "avg_seconds": 32.44,
+      "failures": 0,
+      "samples": 1,
+      "success_rate": 1.0,
+      "successes": 1,
+      "total_seconds": 32.43800000002375,
+      "trusted": false
+    },
+    "check": {
+      "avg_seconds": 17.62,
+      "failures": 0,
+      "samples": 1,
+      "success_rate": 1.0,
+      "successes": 1,
+      "total_seconds": 17.625,
+      "trusted": false
+    },
+    "general": {
+      "avg_seconds": 0.0,
+      "failures": 0,
+      "samples": 0,
+      "success_rate": 0.0,
+      "successes": 0,
+      "total_seconds": 0.0,
+      "trusted": false
+    },
+    "list": {
+      "avg_seconds": 5.92,
+      "failures": 0,
+      "samples": 1,
+      "success_rate": 1.0,
+      "successes": 1,
+      "total_seconds": 5.921999999962281,
+      "trusted": false
+    },
+    "search": {
+      "avg_seconds": 23.56,
+      "failures": 0,
+      "samples": 1,
+      "success_rate": 1.0,
+      "successes": 1,
+      "total_seconds": 23.56299999996554,
+      "trusted": false
+    },
+    "write": {
+      "avg_seconds": 31.95,
+      "failures": 0,
+      "samples": 1,
+      "success_rate": 1.0,
+      "successes": 1,
+      "total_seconds": 31.95300000003772,
+      "trusted": false
+    }
+  },
+  "role": "worker",
+  "samples": 5,
+  "stale": false,
+  "stale_reason": null,
+  "success_rate": 1.0,
+  "successes": 5,
+  "total_seconds": 111.50099999998929,
+  "trusted": false,
+  "worst_task_types": [
+    "analyze",
+    "write",
+    "search",
+    "check",
+    "list"
+  ]
+}

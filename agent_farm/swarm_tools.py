@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from . import probes
 from .mcp_app import mcp
 from .metrics import track_tool_run
 from .state import MODEL_TIERS, OLLAMA_URL, colonies, stats
@@ -19,6 +20,7 @@ from .colony import (
     execute_parallel_swarm,
     entangle_colony,
 )
+from .colony_tools import _probe_summary_for
 from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
 from .action_log import log_action, redact_url
 from .reliability import (
@@ -686,7 +688,7 @@ SYNTHESIS (be concise, extract key insights):"""
 
 @mcp.tool()
 @track_tool_run()
-async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False, synthesize: bool = False) -> dict:
+async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False, synthesize: bool = False, run_probes: bool = True) -> dict:
     """
     Deploy tool-enabled agents that can use real system tools.
     Each bug role has different tool permissions:
@@ -707,6 +709,11 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     
     deep: Enable deep work mode - bugs chain multiple tool calls for complex tasks
     synthesize: If True, uses qwen2.5:14b to synthesize results into unified summary
+
+    Profiler factory Phase 2: unless run_probes is False, the
+    probe harness runs automatically after the spawn and before
+    the tasks, and the results land on the profile cards in
+    profiles/.
     """
     import time
     from .agent import run_tool_swarm
@@ -765,6 +772,12 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     # no-op swarm, and over-long lists are rejected.
     if not task_list:
         return {"error": "tasks must not be empty"}
+    # Profiler factory Phase 2: probes run after the tasks
+    # validate and before the real work, so a bad payload never
+    # pays the probe cost.
+    probe_summary = None
+    if run_probes:
+        probe_summary = await _probe_summary_for(colony)
     bug_results = await asyncio.to_thread(run_tool_swarm, bug_tasks, colony.bugs, deep) if bug_tasks else []
     results = direct_results + bug_results
 
@@ -785,7 +798,8 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
         "deep_mode": deep,
         "results": results,
         "synthesis": synthesis,
-        "elapsed_seconds": round(elapsed, 2)
+        "elapsed_seconds": round(elapsed, 2),
+        "probes": probe_summary,
     }
 
 

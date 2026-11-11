@@ -8,6 +8,7 @@ Agent Farm v3.4 - Structured Output Edition
 
 import json
 import re
+import time
 import httpx
 from typing import Dict, List, Optional, Any
 from .tools import (
@@ -15,6 +16,13 @@ from .tools import (
     get_tool_descriptions_for_role,
     execute_tool,
     TOOL_REGISTRY
+)
+from .profiles import (
+    TASK_TYPE_ROLES,
+    classify_result,
+    profile_pick,
+    record_profile_run,
+    task_type_for_prompt,
 )
 from .reliability import MODEL_SEMAPHORE
 
@@ -679,43 +687,29 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
 # ============ TASK ROUTING ============
 
 def get_best_bug_for_task(task: Dict, bugs: List) -> 'Bug':
-    """Smart routing - match task to appropriate bug role"""
-    prompt = task.get("prompt", "").lower()
-    
-    # Write operations need workers
-    write_keywords = ["write", "create file", "save to", "output to", "append to"]
-    if any(kw in prompt for kw in write_keywords):
-        workers = [b for b in bugs if b.role == "worker"]
-        if workers:
-            return workers[0]
-    
-    # HTTP operations need workers  
-    http_keywords = ["http", "api", "fetch", "request", "post to", "get from"]
-    if any(kw in prompt for kw in http_keywords):
-        workers = [b for b in bugs if b.role == "worker"]
-        if workers:
-            return workers[0]
-    
-    # Knowledge base queries need memory bugs
-    kb_keywords = ["kmkb", "knowledge", "search knowledge", "ask knowledge"]
-    if any(kw in prompt for kw in kb_keywords):
-        memory = [b for b in bugs if b.role == "memory"]
-        if memory:
-            return memory[0]
-    
-    # System monitoring needs guardians
-    monitor_keywords = ["monitor", "health check", "system status", "check service"]
-    if any(kw in prompt for kw in monitor_keywords):
-        guardians = [b for b in bugs if b.role == "guardian"]
-        if guardians:
-            return guardians[0]
-    
+    """Smart routing - match task to appropriate bug role.
+
+    Uses the shared keyword table (profiles.TASK_TYPE_KEYWORDS),
+    the same table colony.get_best_bug_for_task routes with and
+    the profiler records with, so all three agree on what a
+    prompt is. Measured profile evidence comes first, the same
+    as on the colony path. The final fallback is the first
+    worker, then any bug.
+    """
+    task_type = task_type_for_prompt(task.get("prompt", ""))
+    picked = profile_pick(task_type, bugs)
+    if picked is not None:
+        return picked
+    role = TASK_TYPE_ROLES.get(task_type)
+    if role:
+        matches = [b for b in bugs if b.role == role]
+        if matches:
+            return matches[0]
     # Default: worker if available, else first bug
     workers = [b for b in bugs if b.role == "worker"]
     if workers:
         return workers[0]
     return bugs[0]
-
 
 def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Dict]:
     """Run tool-enabled agents in parallel.
@@ -798,14 +792,33 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                 task.get("prompt", ""),
                 task.get("context", ""),
                 deep=deep
-            ): (bug, task)
+            ): (bug, task, time.monotonic())
             for bug, task in bug_assignments
         }
-        
+
         for future in as_completed(futures):
-            bug, task = futures[future]
+            bug, task, started = futures[future]
+            # Profiler factory: tool-swarm work is real work, so it
+            # feeds the bug's profile card too. The elapsed time
+            # covers the whole agent run (model calls plus tool
+            # calls), not just the model time. Direct-execute tasks
+            # (model "none") and no-bug failures never reach this
+            # loop, so they are not recorded: no model ran for them.
             try:
                 result = future.result()
+                elapsed = time.monotonic() - started
+                card_success, failure_kind = classify_result(result["answer"])
+                if result["status"] != "completed":
+                    card_success = False
+                    failure_kind = failure_kind or "error"
+                saved = record_profile_run(
+                    bug.role,
+                    bug.model,
+                    task_type_for_prompt(task.get("prompt", "")),
+                    elapsed,
+                    card_success,
+                    failure_kind,
+                )
                 results.append({
                     "bug_id": bug.id,
                     "role": bug.role,
@@ -815,14 +828,27 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                     "tool_calls": len(result["tool_calls"]),
                     "iterations": result["iterations"],
                     "status": result["status"],
-                    "mode": result.get("mode", "unknown")
+                    "mode": result.get("mode", "unknown"),
+                    "elapsed_seconds": round(elapsed, 2),
+                    "profile_saved": saved,
                 })
             except Exception as e:
+                elapsed = time.monotonic() - started
+                saved = record_profile_run(
+                    bug.role,
+                    bug.model,
+                    task_type_for_prompt(task.get("prompt", "")),
+                    elapsed,
+                    False,
+                    "error",
+                )
                 results.append({
                     "bug_id": bug.id,
                     "role": bug.role,
                     "error": str(e),
-                    "status": "failed"
+                    "status": "failed",
+                    "elapsed_seconds": round(elapsed, 2),
+                    "profile_saved": saved,
                 })
-    
+
     return results

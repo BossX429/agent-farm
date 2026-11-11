@@ -55,14 +55,37 @@ EXEC_TIMEOUT = 60      # 60 second max for commands
 BLOCKED_PATHS = ["/etc/shadow", "/etc/passwd", "/etc/gshadow", "/etc/sudoers",
                  "/root", "/boot", "/sys", "/proc/kcore"]
 
+def _known_temp_roots() -> list:
+    """Well-known temp locations for this platform, canonicalised.
+
+    These are the only places a system temp dir can legitimately
+    be. A TEMP/TMPDIR that points anywhere else -- a home dir, a
+    project folder, a drive root -- is not a temp dir this code
+    can verify, so it is not trusted, even if it exists.
+    """
+    roots = []
+    if os.name == "nt":
+        for env in ("LOCALAPPDATA", "SystemRoot"):
+            base = os.environ.get(env, "")
+            if base:
+                roots.append(os.path.join(base, "Temp"))
+        drive, _ = os.path.splitdrive(os.path.abspath(os.sep))
+        if drive:
+            roots.append(drive + os.sep + "Temp")
+    else:
+        roots = ["/tmp", "/var/tmp", "/dev/shm"]
+    return [os.path.realpath(root) for root in roots]
+
+
 def _is_dedicated_temp_dir(path: str) -> bool:
-    """True iff `path` is a real, dedicated temp dir.
+    """True iff `path` is a real directory under a well-known temp location.
 
     Guards the allowlist against a TEMP/TMPDIR that points somewhere
-    broad: adding a home dir or a drive root would make the whole home
-    folder or drive writable, which is not a temp dir. Only a directory
-    that exists, is not the user's home, and is not a filesystem root
-    counts.
+    broad or sensitive: a home dir, a drive root, or any other folder
+    would make that whole area writable through the file tools.
+    Only a directory that exists and sits under one of the platform's
+    known temp locations counts. Anything else fails closed: the
+    write is rejected rather than the boundary widened.
     """
     try:
         real = os.path.realpath(path)
@@ -70,14 +93,14 @@ def _is_dedicated_temp_dir(path: str) -> bool:
         return False
     if not os.path.isdir(real):
         return False
-    if real == os.path.realpath(os.path.expanduser("~")):
-        return False
-    # Filesystem root: "/" on POSIX; "C:\" (or any drive root) on Windows.
-    drive, _ = os.path.splitdrive(real)
-    if real == drive + os.sep or real == os.sep:
-        return False
-    return True
-
+    for root in _known_temp_roots():
+        try:
+            if os.path.commonpath([real, root]) == root:
+                return True
+        except ValueError:
+            # Different drives on Windows: not under this root.
+            continue
+    return False
 
 # Directories writes are allowed in (see tool_write_file). Matched with
 # commonpath() against the canonical path, so "/tmpfoo" does NOT pass as

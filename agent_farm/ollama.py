@@ -5,6 +5,7 @@ import uuid
 import json
 import httpx
 import asyncio
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
@@ -30,7 +31,7 @@ async def query_ollama(model: str, prompt: str, grounded: bool = True) -> str:
         return f"Error: {str(e)}"
 
 
-def sync_query_ollama(model: str, prompt: str, grounded: bool = True) -> str:
+def sync_query_ollama(model: str, prompt: str, grounded: bool = True, slot_held: bool = False) -> str:
     """Synchronous wrapper for parallel execution.
 
     Model calls are gated by the shared MODEL_SEMAPHORE (see
@@ -38,10 +39,17 @@ def sync_query_ollama(model: str, prompt: str, grounded: bool = True) -> str:
     cannot each run an unbounded number of simultaneous model
     requests. This is a queue, not a cancellation: a call waits for
     a slot instead of starting immediately.
+
+    slot_held=True means the caller already holds a semaphore
+    slot (probes.py does this so it can start its clock after
+    the wait, not before). The call then skips acquiring a
+    second slot: holding one while waiting for another would
+    deadlock once the pool size matches the semaphore size.
     """
     full_prompt = f"{GROUNDING}\n\n{prompt}" if grounded else prompt
     try:
-        with MODEL_SEMAPHORE, httpx.Client() as client:
+        slot = nullcontext() if slot_held else MODEL_SEMAPHORE
+        with slot, httpx.Client() as client:
             resp = client.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={"model": model, "prompt": full_prompt, "stream": False},
