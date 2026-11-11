@@ -43,6 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .state import MODEL_TIERS
+
 # Locked by Kyle 2026-11-10: 5 samples per task type before a
 # profile card is trusted.
 MIN_SAMPLES_PER_TYPE = 5
@@ -404,6 +406,70 @@ def _save_card(card: Dict[str, Any]) -> bool:
         return True
     except (OSError, ValueError, TypeError):
         return False
+
+
+def prune_stale_profiles() -> List[str]:
+    """Delete profile cards that can never be used again.
+
+    Removes two kinds of stale file, and nothing else:
+    - A legacy card file when the machine-scoped card for the
+      same role + model exists: the legacy is a duplicate, and
+      the save that created the scoped card should have removed
+      it, but a card that is never saved again (see below)
+      leaves it behind.
+    - A card for a role + model combination no current bug can
+      use: its model is no longer assigned to that role in
+      MODEL_TIERS, so no bug will ever match it, it will never
+      gain samples, and routing will never pick it. This is what
+      happens when a role's model changes (the worker moving
+      from qwen3:4b to qwen2.5-coder leaves a worker-qwen3:4b
+      card behind, trusted but useless).
+    Only this machine's cards are removed: a file whose name
+    ends with another machine's slug is left alone, and a legacy
+    file is this machine's by adoption. Returns the removed
+    filenames, so a caller can report what was cleaned up.
+    Never raises: a read or delete failure just skips that file.
+    """
+    removed: List[str] = []
+    try:
+        files = sorted(profiles_dir().glob("*.json"))
+    except OSError:
+        return removed
+    current = set(MODEL_TIERS.items())
+    slug = machine_slug()
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                card = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(card, dict):
+            continue
+        role = card.get("role")
+        model = card.get("model")
+        if not isinstance(role, str) or not isinstance(model, str):
+            continue
+        is_legacy = path == _legacy_card_path(role, model)
+        is_mine = is_legacy or path.name.endswith(f"-{slug}.json")
+        if not is_mine:
+            continue
+        # Legacy duplicate: the scoped card exists, so the
+        # legacy file is redundant.
+        if is_legacy and _card_path(role, model).exists():
+            try:
+                path.unlink()
+                removed.append(path.name)
+            except OSError:
+                pass
+            continue
+        # Orphaned combo: no bug can have this role + model.
+        if (role, model) not in current:
+            try:
+                path.unlink()
+                removed.append(path.name)
+            except OSError:
+                pass
+    return removed
 
 
 def get_profile(role: str, model: str) -> Optional[Dict[str, Any]]:

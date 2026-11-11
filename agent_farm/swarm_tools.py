@@ -21,6 +21,7 @@ from .colony import (
     entangle_colony,
 )
 from .colony_tools import _probe_summary_for
+from .profiles import prune_stale_profiles
 from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
 from .action_log import log_action, redact_url
 from .reliability import (
@@ -722,6 +723,9 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     
     # Spawn colony
     colony = spawn_colony_internal(colony_type)
+    # Stale profile cards are removed on every spawn, so they
+    # can never accumulate. The prune never raises.
+    prune_stale_profiles()
     
     # Parse tasks
     payload_error = validate_parallel_payload(tasks, "tasks")
