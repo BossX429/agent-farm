@@ -20,6 +20,7 @@ from .colony import (
     execute_parallel_swarm,
     entangle_colony,
 )
+from .colony_tools import _probe_summary_for
 from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
 from .action_log import log_action, redact_url
 from .reliability import (
@@ -776,17 +777,7 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     # pays the probe cost.
     probe_summary = None
     if run_probes:
-        try:
-            probe_results = await asyncio.to_thread(probes.run_probes, colony)
-            probe_summary = probes.summarize_probe_results(probe_results)
-        except Exception:
-            probe_summary = {
-                "probed": 0,
-                "successes": 0,
-                "failures": 0,
-                "elapsed_seconds": 0.0,
-                "error": "probe run failed",
-            }
+        probe_summary = await _probe_summary_for(colony)
     bug_results = await asyncio.to_thread(run_tool_swarm, bug_tasks, colony.bugs, deep) if bug_tasks else []
     results = direct_results + bug_results
 

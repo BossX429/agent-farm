@@ -34,10 +34,11 @@ The guards in place today, in one place:
   writes are allowed only inside `/tmp`, `/home/kyle/repos`,
   `/home/kyle/Desktop`, and the platform's system temp directory
   (on Linux that is `/tmp` already; on Windows it is the user's Temp
-  folder, and it is only added when it is a real dedicated temp dir,
-  not a home dir or drive root). Paths are checked after resolving
-  symlinks and `..` components, so prefix look-alikes and symlink
-  tricks do not bypass them.
+  folder, and it is only added when it sits under a well-known temp
+  location (`/tmp`, `/var/tmp`, or the Windows Temp folders), never a
+  home dir, a drive root, or any other folder a TEMP setting points at).
+  Paths are checked after resolving symlinks and `..` components, so
+  prefix look-alikes and symlink tricks do not bypass them.
 - **HTTP / SSRF**: only public http/https URLs are fetched, each
   validated once and then connected to that exact validated IP
   (IP pinning), with redirects re-validated hop by hop. URLs with

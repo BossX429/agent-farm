@@ -108,16 +108,22 @@ def test_write_path_allowed_in_system_temp_dir(tmp_path):
         assert tools.is_write_path_allowed(str(tmp_path / "x.txt"))
 
 
-def test_dedicated_temp_dir_validation():
-    # The temp-dir guard: a real temp dir passes, but a home dir, a
-    # filesystem root, or a missing dir must never be added to the
-    # write allowlist, or the whole home folder or drive becomes
-    # writable.
-    assert tools._is_dedicated_temp_dir(tempfile.gettempdir())
+def test_dedicated_temp_dir_validation(tmp_path):
+    # The temp-dir guard: a real dedicated temp dir passes, but a
+    # home dir, a filesystem root, or a missing dir must never be
+    # added to the write allowlist, or the whole home folder or
+    # drive becomes writable. The passing case uses a directory
+    # created under tmp_path (which itself lives under a known
+    # temp location), not the configured temp dir: the configured
+    # dir may legitimately point somewhere the guard must reject,
+    # and the test must not fail for a TEMP setting the guard is
+    # right to refuse.
+    dedicated = tmp_path / "dedicated-temp"
+    dedicated.mkdir()
+    assert tools._is_dedicated_temp_dir(str(dedicated))
     assert not tools._is_dedicated_temp_dir(os.path.expanduser("~"))
     assert not tools._is_dedicated_temp_dir(os.path.abspath(os.sep))
     assert not tools._is_dedicated_temp_dir("/nonexistent-xyz-12345")
-
 
 def test_exec_blocked_does_not_run(tmp_path):
     marker = tmp_path / "should_not_exist.txt"

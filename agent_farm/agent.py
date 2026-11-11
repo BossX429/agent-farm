@@ -17,6 +17,13 @@ from .tools import (
     execute_tool,
     TOOL_REGISTRY
 )
+from .profiles import (
+    TASK_TYPE_ROLES,
+    classify_result,
+    profile_pick,
+    record_profile_run,
+    task_type_for_prompt,
+)
 from .reliability import MODEL_SEMAPHORE
 
 OLLAMA_URL = "http://localhost:11434"
@@ -680,43 +687,29 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
 # ============ TASK ROUTING ============
 
 def get_best_bug_for_task(task: Dict, bugs: List) -> 'Bug':
-    """Smart routing - match task to appropriate bug role"""
-    prompt = task.get("prompt", "").lower()
-    
-    # Write operations need workers
-    write_keywords = ["write", "create file", "save to", "output to", "append to"]
-    if any(kw in prompt for kw in write_keywords):
-        workers = [b for b in bugs if b.role == "worker"]
-        if workers:
-            return workers[0]
-    
-    # HTTP operations need workers  
-    http_keywords = ["http", "api", "fetch", "request", "post to", "get from"]
-    if any(kw in prompt for kw in http_keywords):
-        workers = [b for b in bugs if b.role == "worker"]
-        if workers:
-            return workers[0]
-    
-    # Knowledge base queries need memory bugs
-    kb_keywords = ["kmkb", "knowledge", "search knowledge", "ask knowledge"]
-    if any(kw in prompt for kw in kb_keywords):
-        memory = [b for b in bugs if b.role == "memory"]
-        if memory:
-            return memory[0]
-    
-    # System monitoring needs guardians
-    monitor_keywords = ["monitor", "health check", "system status", "check service"]
-    if any(kw in prompt for kw in monitor_keywords):
-        guardians = [b for b in bugs if b.role == "guardian"]
-        if guardians:
-            return guardians[0]
-    
+    """Smart routing - match task to appropriate bug role.
+
+    Uses the shared keyword table (profiles.TASK_TYPE_KEYWORDS),
+    the same table colony.get_best_bug_for_task routes with and
+    the profiler records with, so all three agree on what a
+    prompt is. Measured profile evidence comes first, the same
+    as on the colony path. The final fallback is the first
+    worker, then any bug.
+    """
+    task_type = task_type_for_prompt(task.get("prompt", ""))
+    picked = profile_pick(task_type, bugs)
+    if picked is not None:
+        return picked
+    role = TASK_TYPE_ROLES.get(task_type)
+    if role:
+        matches = [b for b in bugs if b.role == role]
+        if matches:
+            return matches[0]
     # Default: worker if available, else first bug
     workers = [b for b in bugs if b.role == "worker"]
     if workers:
         return workers[0]
     return bugs[0]
-
 
 def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Dict]:
     """Run tool-enabled agents in parallel.

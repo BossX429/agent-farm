@@ -21,8 +21,13 @@ from .state import (
 )
 from .ollama import sync_query_ollama
 from .metrics import record_bug_run
-from .profiles import classify_result, record_profile_run, task_type_for_prompt
-
+from .profiles import (
+    TASK_TYPE_ROLES,
+    classify_result,
+    profile_pick,
+    record_profile_run,
+    task_type_for_prompt,
+)
 
 def _unique_id(prefix: str) -> str:
     """Unique, human-readable ID.
@@ -68,51 +73,23 @@ def spawn_colony_internal(colony_type: str = "standard") -> Colony:
 
 
 def get_best_bug_for_task(task: Dict, colony: Colony) -> Bug:
-    """Smart routing - match task to appropriate bug role"""
-    prompt = task.get("prompt", "").lower()
-    
-    # Write operations need workers
-    write_keywords = ["write", "create file", "save to", "output to", "append to"]
-    if any(kw in prompt for kw in write_keywords):
-        workers = [b for b in colony.bugs if b.role == "worker"]
-        if workers:
-            return workers[0]
-    
-    # HTTP operations need workers
-    http_keywords = ["http", "api", "fetch", "request", "post to", "get from"]
-    if any(kw in prompt for kw in http_keywords):
-        workers = [b for b in colony.bugs if b.role == "worker"]
-        if workers:
-            return workers[0]
-    
-    # Knowledge base queries need memory bugs
-    kb_keywords = ["kmkb", "knowledge", "search knowledge", "ask knowledge"]
-    if any(kw in prompt for kw in kb_keywords):
-        memory = [b for b in colony.bugs if b.role == "memory"]
-        if memory:
-            return memory[0]
-    
-    # Code analysis needs learners
-    analysis_keywords = ["analyze code", "review code", "code quality"]
-    if any(kw in prompt for kw in analysis_keywords):
-        learners = [b for b in colony.bugs if b.role == "learner"]
-        if learners:
-            return learners[0]
-    
-    # System monitoring needs guardians
-    monitor_keywords = ["monitor", "health check", "system status", "check service"]
-    if any(kw in prompt for kw in monitor_keywords):
-        guardians = [b for b in colony.bugs if b.role == "guardian"]
-        if guardians:
-            return guardians[0]
-    
-    # Recon/exploration needs scouts
-    recon_keywords = ["list", "find", "explore", "scan", "read file", "check if"]
-    if any(kw in prompt for kw in recon_keywords):
-        scouts = [b for b in colony.bugs if b.role == "scout"]
-        if scouts:
-            return scouts[0]
-    
+    """Smart routing - match task to appropriate bug role.
+
+    Measured profile evidence comes first: a trusted card for
+    the task type picks the bug. Otherwise the shared keyword
+    table (profiles.TASK_TYPE_KEYWORDS) routes by role, so the
+    router and the profiler always agree on what a prompt is.
+    The final fallback is the first worker, then any bug.
+    """
+    task_type = task_type_for_prompt(task.get("prompt", ""))
+    picked = profile_pick(task_type, colony.bugs)
+    if picked is not None:
+        return picked
+    role = TASK_TYPE_ROLES.get(task_type)
+    if role:
+        bugs = [b for b in colony.bugs if b.role == role]
+        if bugs:
+            return bugs[0]
     # Default: return first available worker, then any bug
     workers = [b for b in colony.bugs if b.role == "worker"]
     if workers:
@@ -198,7 +175,7 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                 error = response
                 response = None
             if error is None:
-                results.append({
+                result = {
                     "bug_id": bug.id,
                     "role": bug.role,
                     "model": bug.model,
@@ -206,19 +183,21 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                     "response": response,
                     "status": "success",
                     "elapsed_seconds": elapsed_seconds,
-                })
+                }
+                results.append(result)
                 record_bug_run(bug.id, elapsed, True, role=bug.role, model=bug.model)
                 bug.status = "completed"
                 bug.last_task = task.get("prompt", "")[:50]
             else:
-                results.append({
+                result = {
                     "bug_id": bug.id,
                     "role": bug.role,
                     "model": bug.model,
                     "error": error,
                     "status": "failed",
                     "elapsed_seconds": elapsed_seconds,
-                })
+                }
+                results.append(result)
                 record_bug_run(bug.id, elapsed, False, role=bug.role, model=bug.model)
             # Profiler factory Phase 2: feed the run into the bug's
             # profile card. A card counts a run as a success only
@@ -228,8 +207,11 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
             # success in the per-bug metrics and as a failure of
             # kind "uncertain" on the card. record_profile_run
             # never raises, so profiling cannot break the swarm.
+            # Its return is reported on the result, not swallowed:
+            # a caller that sees profile_saved False knows the run
+            # was not stored.
             card_success, failure_kind = classify_result(response, error)
-            record_profile_run(
+            result["profile_saved"] = record_profile_run(
                 bug.role,
                 bug.model,
                 task_type_for_prompt(task.get("prompt", "")),
@@ -237,7 +219,7 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                 card_success,
                 failure_kind,
             )
-    
+
     elapsed = time.time() - start
     colony.tasks_completed += len(tasks)
     stats["tasks_executed"] += len(tasks)

@@ -25,6 +25,35 @@ from .reliability import validate_parallel_items, validate_parallel_payload
 
 # ============ MCP TOOLS ============
 
+async def _probe_summary_for(colony) -> dict:
+    """Run the probe harness for a colony and summarize it.
+
+    A failed probe run returns an error summary, never a failed
+    spawn. If the caller is cancelled while probes are running,
+    the colony is removed from the registry before the
+    cancellation propagates: a colony nobody can reach by id is
+    an orphan, and its probe threads finish in the background
+    on their own.
+    """
+    try:
+        probe_results = await asyncio.to_thread(probes.run_probes, colony)
+        return probes.summarize_probe_results(probe_results)
+    except asyncio.CancelledError:
+        colonies.pop(colony.id, None)
+        raise
+    except Exception:
+        return {
+            "probed": 0,
+            "successes": 0,
+            "failures": 0,
+            "incomplete": 0,
+            "elapsed_seconds": 0.0,
+            "total_call_seconds": 0.0,
+            "profile_save_failures": 0,
+            "error": "probe run failed",
+        }
+
+
 @mcp.tool()
 @track_tool_run()
 async def spawn_colony(colony_type: str = "standard", run_probes: bool = True) -> dict:
@@ -46,17 +75,7 @@ async def spawn_colony(colony_type: str = "standard", run_probes: bool = True) -
     colony = spawn_colony_internal(colony_type)
     probe_summary = None
     if run_probes:
-        try:
-            probe_results = await asyncio.to_thread(probes.run_probes, colony)
-            probe_summary = probes.summarize_probe_results(probe_results)
-        except Exception:
-            probe_summary = {
-                "probed": 0,
-                "successes": 0,
-                "failures": 0,
-                "elapsed_seconds": 0.0,
-                "error": "probe run failed",
-            }
+        probe_summary = await _probe_summary_for(colony)
     return {
         "colony_id": colony.id,
         "type": colony_type,
@@ -131,17 +150,7 @@ async def quick_swarm(tasks: str, colony_type: str = "fast", run_probes: bool = 
 
     probe_summary = None
     if run_probes:
-        try:
-            probe_results = await asyncio.to_thread(probes.run_probes, colony)
-            probe_summary = probes.summarize_probe_results(probe_results)
-        except Exception:
-            probe_summary = {
-                "probed": 0,
-                "successes": 0,
-                "failures": 0,
-                "elapsed_seconds": 0.0,
-                "error": "probe run failed",
-            }
+        probe_summary = await _probe_summary_for(colony)
 
     results = await asyncio.to_thread(execute_parallel_swarm, task_list, colony)
     

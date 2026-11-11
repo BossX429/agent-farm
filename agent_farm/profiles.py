@@ -510,25 +510,48 @@ def classify_result(response: Any, error: Optional[str] = None) -> Tuple[bool, O
 def task_type_for_prompt(prompt: str) -> str:
     """Classify a task prompt into a probe task type.
 
-    Uses the same keyword lists as colony.get_best_bug_for_task,
-    so a real run and a probe job land in the same bucket. A
-    prompt that matches nothing is "general", not a guess at
-    one of the measured types.
+    Uses the shared TASK_TYPE_KEYWORDS table, the same table
+    colony.get_best_bug_for_task routes with, so a real run and
+    a probe job land in the same bucket. A prompt that matches
+    nothing is "general", not a guess at one of the measured types.
     """
     text = (prompt or "").lower()
-    if any(kw in text for kw in ("write", "create file", "save to", "output to", "append to")):
-        return "write"
-    if any(kw in text for kw in ("http", "api", "fetch", "request", "post to", "get from")):
-        return "write"
-    if any(kw in text for kw in ("analyze code", "review code", "code quality")):
-        return "analyze"
-    if any(kw in text for kw in ("kmkb", "knowledge", "search knowledge", "ask knowledge", "search")):
-        return "search"
-    if any(kw in text for kw in ("monitor", "health check", "system status", "check service")):
-        return "check"
-    if any(kw in text for kw in ("list", "find", "explore", "scan", "read file", "check if")):
-        return "list"
+    for task_type, (keywords, _role) in TASK_TYPE_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            return task_type
     return "general"
+
+
+def profile_pick(task_type: str, bugs: List[Any]) -> Optional[Any]:
+    """Pick a bug from measured profile evidence, or None.
+
+    A bug is picked this way only when its role + model has a
+    trusted, non-stale card for this machine and that card's
+    entry for the task type is trusted too. Among several, the
+    highest success rate wins, then the fastest. Anything less
+    than that falls back to keyword routing: an untrusted card
+    is a hint, not evidence. Cards are read from disk on each
+    call; they are small JSON files and the OS caches them.
+    Both routers (colony and agent) use this one function, so
+    a profile pick means the same thing on either path.
+    """
+    best = None
+    best_key = None
+    for card in list_profiles():
+        if card.get("machine") != machine_slug():
+            continue
+        if not card.get("trusted") or card.get("stale"):
+            continue
+        entry = card.get("per_task_type", {}).get(task_type)
+        if not entry or not entry.get("trusted"):
+            continue
+        for bug in bugs:
+            if bug.role == card["role"] and bug.model == card["model"]:
+                key = (entry["success_rate"], -entry["avg_seconds"])
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best = bug
+    return best
 
 
 def record_profile_run(
