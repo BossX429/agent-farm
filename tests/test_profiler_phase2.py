@@ -31,6 +31,7 @@ from agent_farm.profiles import (
     list_profiles,
     machine_slug,
     profiles_summary,
+    prune_stale_profiles,
     record_profile_run,
     retire_profile,
     task_type_for_prompt,
@@ -204,6 +205,117 @@ def test_task_type_for_prompt():
     assert task_type_for_prompt("check service status") == "check"
     assert task_type_for_prompt("list files in the folder") == "list"
     assert task_type_for_prompt("do something vague") == "general"
+
+
+def test_prune_removes_legacy_duplicate(monkeypatch, tmp_path):
+    # A legacy card file is a duplicate once the machine-scoped
+    # card for the same role + model exists. The prune removes
+    # the legacy file and keeps the scoped card.
+    import json
+
+    from agent_farm.profiles import _card_path, _legacy_card_path
+
+    _profile_dir(monkeypatch, tmp_path)
+    record_profile_run("scout", "qwen3:4b", "list", 0.1, True)
+    scoped = _card_path("scout", "qwen3:4b")
+    assert scoped.exists()
+    legacy = _legacy_card_path("scout", "qwen3:4b")
+    card = json.loads(scoped.read_text(encoding="utf-8"))
+    legacy.write_text(json.dumps(card), encoding="utf-8")
+    removed = prune_stale_profiles()
+    assert legacy.name in removed
+    assert not legacy.exists()
+    assert scoped.exists()
+    assert get_profile("scout", "qwen3:4b") is not None
+
+
+def test_prune_removes_orphaned_combo(monkeypatch, tmp_path):
+    # A card for a role + model no bug can use anymore (its
+    # model is no longer assigned to that role) is removed.
+    # This is the worker-qwen3:4b card left behind when the
+    # worker moved to the coder model.
+    import json
+
+    from agent_farm.profiles import _card_path, _legacy_card_path
+    from agent_farm.state import MODEL_TIERS
+
+    _profile_dir(monkeypatch, tmp_path)
+    # Build an orphaned card: worker + a model no role uses.
+    record_profile_run("worker", "qwen3:4b", "write", 0.1, True)
+    assert ("worker", "qwen3:4b") not in set(MODEL_TIERS.items())
+    orphan = _card_path("worker", "qwen3:4b")
+    assert orphan.exists()
+    # And its legacy file, which lingers because the card is
+    # never saved again once orphaned.
+    legacy = _legacy_card_path("worker", "qwen3:4b")
+    legacy.write_text(orphan.read_text(encoding="utf-8"), encoding="utf-8")
+    removed = prune_stale_profiles()
+    assert orphan.name in removed
+    assert legacy.name in removed
+    assert not orphan.exists()
+    assert not legacy.exists()
+    assert get_profile("worker", "qwen3:4b") is None
+
+
+def test_prune_keeps_current_cards(monkeypatch, tmp_path):
+    # Cards for role + model combos a bug can actually have
+    # are never touched, however many samples they hold.
+    from agent_farm.state import MODEL_TIERS
+
+    _profile_dir(monkeypatch, tmp_path)
+    for role, model in MODEL_TIERS.items():
+        record_profile_run(role, model, "write", 0.1, True)
+    removed = prune_stale_profiles()
+    assert removed == []
+    for role, model in MODEL_TIERS.items():
+        assert get_profile(role, model) is not None
+
+
+def test_prune_keeps_other_machines_cards(monkeypatch, tmp_path):
+    # A card file from another machine is not this machine's
+    # to delete, even when its combo is orphaned here.
+    import json
+
+    _profile_dir(monkeypatch, tmp_path)
+    other = tmp_path / "worker-qwen3-4b-40862b30-othermachine.json"
+    card = create_profile("worker", "qwen3:4b")
+    card["machine"] = "othermachine"
+    other.write_text(json.dumps(card), encoding="utf-8")
+    removed = prune_stale_profiles()
+    assert removed == []
+    assert other.exists()
+
+
+def test_prune_never_raises(monkeypatch, tmp_path):
+    # A malformed card file, a card missing its role/model, and
+    # a missing profiles dir are all skipped, not raised.
+    _profile_dir(monkeypatch, tmp_path)
+    (tmp_path / "broken.json").write_text("{not json", encoding="utf-8")
+    (tmp_path / "no-role.json").write_text('{"model": "qwen3:4b"}', encoding="utf-8")
+    removed = prune_stale_profiles()
+    assert removed == []
+    # A profiles dir that does not exist at all.
+    monkeypatch.setenv("AGENT_FARM_PROFILES_DIR", str(tmp_path / "missing"))
+    assert prune_stale_profiles() == []
+
+
+def test_spawn_prunes_stale_cards(monkeypatch, tmp_path):
+    # The cleanup runs on a real spawn through the MCP tool
+    # layer, so a stale card left by a model change is gone
+    # after the next spawn, without anyone asking for it.
+    from agent_farm.profiles import _card_path
+
+    _profile_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
+    record_profile_run("worker", "qwen3:4b", "write", 0.1, True)
+    orphan = _card_path("worker", "qwen3:4b")
+    assert orphan.exists()
+
+    async def main():
+        return await server.spawn_colony("standard", run_probes=False)
+
+    asyncio.run(main())
+    assert not orphan.exists()
 
 
 def test_mixed_model_roles_are_distinct():

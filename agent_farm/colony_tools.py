@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from . import probes
 from .mcp_app import mcp
 from .metrics import track_tool_run
-from .profiles import profiles_summary
+from .profiles import profiles_summary, prune_stale_profiles
 from .state import MODEL_TIERS, OLLAMA_URL, colonies, stats
 from .colony import (
     spawn_colony_internal,
@@ -73,6 +73,10 @@ async def spawn_colony(colony_type: str = "standard", run_probes: bool = True) -
     recorded as failed probes, never as a failed spawn.
     """
     colony = spawn_colony_internal(colony_type)
+    # Stale profile cards (a legacy duplicate, or a role + model
+    # combo no bug can use anymore) are removed on every spawn,
+    # so they can never accumulate. The prune never raises.
+    prune_stale_profiles()
     probe_summary = None
     if run_probes:
         probe_summary = await _probe_summary_for(colony)
@@ -138,6 +142,9 @@ async def quick_swarm(tasks: str, colony_type: str = "fast", run_probes: bool = 
     if payload_error:
         return {"error": payload_error}
     colony = spawn_colony_internal(colony_type)
+    # Stale profile cards are removed on every spawn, so they
+    # can never accumulate. The prune never raises.
+    prune_stale_profiles()
 
     try:
         task_list = json.loads(tasks)
