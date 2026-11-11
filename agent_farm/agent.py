@@ -20,6 +20,7 @@ from .tools import (
 from .profiles import (
     TASK_TYPE_ROLES,
     classify_result,
+    pick_is_profiled,
     profile_pick,
     record_profile_run,
     task_type_for_prompt,
@@ -811,10 +812,18 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                 if result["status"] != "completed":
                     card_success = False
                     failure_kind = failure_kind or "error"
+                # Phase 3: mark whether this pick was profile-driven.
+                # True means the bug that ran the task has a trusted
+                # card for this task type; False means the router
+                # fell back to keyword routing and the pick was a
+                # guess. The flag is about the routing decision,
+                # not the outcome.
+                task_type = task_type_for_prompt(task.get("prompt", ""))
+                profiled = pick_is_profiled(task_type, bug)
                 saved = record_profile_run(
                     bug.role,
                     bug.model,
-                    task_type_for_prompt(task.get("prompt", "")),
+                    task_type,
                     elapsed,
                     card_success,
                     failure_kind,
@@ -831,13 +840,16 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                     "mode": result.get("mode", "unknown"),
                     "elapsed_seconds": round(elapsed, 2),
                     "profile_saved": saved,
+                    "profiled": profiled,
                 })
             except Exception as e:
                 elapsed = time.monotonic() - started
+                task_type = task_type_for_prompt(task.get("prompt", ""))
+                profiled = pick_is_profiled(task_type, bug)
                 saved = record_profile_run(
                     bug.role,
                     bug.model,
-                    task_type_for_prompt(task.get("prompt", "")),
+                    task_type,
                     elapsed,
                     False,
                     "error",
@@ -849,6 +861,7 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                     "status": "failed",
                     "elapsed_seconds": round(elapsed, 2),
                     "profile_saved": saved,
+                    "profiled": profiled,
                 })
 
     return results

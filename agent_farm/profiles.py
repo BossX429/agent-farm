@@ -525,6 +525,22 @@ def task_type_for_prompt(prompt: str) -> str:
     return "general"
 
 
+def _card_usable_for(card: Dict[str, Any], task_type: str) -> bool:
+    """True when a card can drive a profile pick for a task type.
+
+    The card must be for this machine, trusted, not stale, and
+    its entry for the task type must be trusted too. One helper
+    so profile_pick and pick_is_profiled agree on what counts
+    as evidence; they must never drift apart.
+    """
+    if card.get("machine") != machine_slug():
+        return False
+    if not card.get("trusted") or card.get("stale"):
+        return False
+    entry = card.get("per_task_type", {}).get(task_type)
+    return bool(entry and entry.get("trusted"))
+
+
 def profile_pick(task_type: str, bugs: List[Any]) -> Optional[Any]:
     """Pick a bug from measured profile evidence, or None.
 
@@ -541,12 +557,10 @@ def profile_pick(task_type: str, bugs: List[Any]) -> Optional[Any]:
     best = None
     best_key = None
     for card in list_profiles():
-        if card.get("machine") != machine_slug():
-            continue
-        if not card.get("trusted") or card.get("stale"):
+        if not _card_usable_for(card, task_type):
             continue
         entry = card.get("per_task_type", {}).get(task_type)
-        if not entry or not entry.get("trusted"):
+        if entry is None:
             continue
         for bug in bugs:
             if bug.role == card["role"] and bug.model == card["model"]:
@@ -555,6 +569,27 @@ def profile_pick(task_type: str, bugs: List[Any]) -> Optional[Any]:
                     best_key = key
                     best = bug
     return best
+
+
+def pick_is_profiled(task_type: str, bug: Any) -> bool:
+    """True when one bug's pick for a task type is profile-driven.
+
+    The bug's role + model must have a trusted, non-stale card
+    for this machine whose entry for the task type is trusted.
+    This is the same test profile_pick applies, for one bug: it
+    marks whether the bug that ran a task was chosen on evidence
+    or fell back to keyword routing. A swarm result carries this
+    as "profiled" so the gap is visible, not hidden. Never
+    raises: a missing card or a bad bug is unprofiled, not an
+    error.
+    """
+    try:
+        card = get_profile(bug.role, bug.model)
+    except Exception:
+        return False
+    if card is None:
+        return False
+    return _card_usable_for(card, task_type)
 
 
 def record_profile_run(

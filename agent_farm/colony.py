@@ -24,6 +24,7 @@ from .metrics import record_bug_run
 from .profiles import (
     TASK_TYPE_ROLES,
     classify_result,
+    pick_is_profiled,
     profile_pick,
     record_profile_run,
     task_type_for_prompt,
@@ -174,6 +175,14 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                 # reliability._is_failed_fragment.
                 error = response
                 response = None
+            # Phase 3: mark whether this pick was profile-driven.
+            # The bug that ran the task either has a trusted card
+            # for this task type (evidence) or it does not (the
+            # router fell back to keyword routing). The flag is
+            # about the routing decision, not the outcome, so it
+            # goes on success and failure results alike.
+            task_type = task_type_for_prompt(task.get("prompt", ""))
+            profiled = pick_is_profiled(task_type, bug)
             if error is None:
                 result = {
                     "bug_id": bug.id,
@@ -183,6 +192,7 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                     "response": response,
                     "status": "success",
                     "elapsed_seconds": elapsed_seconds,
+                    "profiled": profiled,
                 }
                 results.append(result)
                 record_bug_run(bug.id, elapsed, True, role=bug.role, model=bug.model)
@@ -196,6 +206,7 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                     "error": error,
                     "status": "failed",
                     "elapsed_seconds": elapsed_seconds,
+                    "profiled": profiled,
                 }
                 results.append(result)
                 record_bug_run(bug.id, elapsed, False, role=bug.role, model=bug.model)
@@ -214,7 +225,7 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
             result["profile_saved"] = record_profile_run(
                 bug.role,
                 bug.model,
-                task_type_for_prompt(task.get("prompt", "")),
+                task_type,
                 elapsed,
                 card_success,
                 failure_kind,
