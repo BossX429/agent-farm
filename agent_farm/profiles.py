@@ -7,6 +7,12 @@ usable answer, how long they took, and which task types went best
 and worst. Cards are built from probe runs (see probes.py) and
 from real swarm runs (recorded in colony.execute_parallel_swarm).
 
+A card is machine-specific: the machine that measured it is part
+of its filename and its contents, so a card built on one machine
+never counts toward trust on another. Cards written before machine
+scoping are adopted by the machine that first loads them and
+re-saved under the new name.
+
 Rules carried over from Phase 1 and from metrics.py:
 - Never invent a token cost or a quality score. A card says
   "fast and usually produces a usable answer", never "good at
@@ -25,9 +31,14 @@ Rules carried over from Phase 1 and from metrics.py:
   measure different things, and both say so.)
 """
 
+import contextlib
+import hashlib
 import json
 import os
+import socket
+import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,7 +53,48 @@ PROBE_TASK_TYPES = ["write", "analyze", "search", "check", "list"]
 # Every task type, including runs that match no known type.
 TASK_TYPES = PROBE_TASK_TYPES + ["general"]
 
+# One keyword table shared by routing (colony.get_best_bug_for_task)
+# and by profile recording (task_type_for_prompt). A prompt must land
+# in the same bucket in both places, or real-run statistics mix with
+# the wrong task type. Each task type names the role that does it.
+TASK_TYPE_KEYWORDS = {
+    "write": (
+        ["write", "create file", "save to", "output to", "append to",
+         "http", "api", "fetch", "request", "post to", "get from"],
+        "worker",
+    ),
+    "analyze": (["analyze code", "review code", "code quality"], "learner"),
+    "search": (
+        ["kmkb", "knowledge", "search knowledge", "ask knowledge", "search"],
+        "memory",
+    ),
+    "check": (
+        ["monitor", "health check", "system status", "check service"],
+        "guardian",
+    ),
+    "list": (["list", "find", "explore", "scan", "read file", "check if"], "scout"),
+}
+TASK_TYPE_ROLES = {
+    task_type: role for task_type, (_, role) in TASK_TYPE_KEYWORDS.items()
+}
+
 _LOCK = threading.Lock()
+
+
+def machine_slug() -> str:
+    """Short stable id for this machine, used to scope cards.
+
+    Cards are machine-specific measurements: a card built on one
+    machine must never count toward trust on another, so the
+    machine is part of the card's filename and its contents.
+    """
+    try:
+        name = socket.gethostname() or "unknown"
+    except Exception:
+        name = "unknown"
+    slug = "".join(ch if ch.isalnum() else "-" for ch in name.lower())
+    slug = "-".join(part for part in slug.split("-") if part)[:32]
+    return slug or "unknown"
 
 
 def profiles_dir() -> Path:
@@ -58,6 +110,20 @@ def profiles_dir() -> Path:
 
 
 def _card_path(role: str, model: str) -> Path:
+    """Card file for a role + model on this machine.
+
+    The model hash keeps two model names that normalize to the
+    same string (for example "qwen3:4b" and "qwen3-4b") in
+    separate files, and the machine slug keeps one machine's
+    measurements out of another machine's cards.
+    """
+    safe_model = model.replace(":", "-").replace("/", "-")
+    digest = hashlib.sha1(model.encode("utf-8")).hexdigest()[:8]
+    return profiles_dir() / f"{role}-{safe_model}-{digest}-{machine_slug()}.json"
+
+
+def _legacy_card_path(role: str, model: str) -> Path:
+    """The pre-machine-scope card filename, for one-time migration."""
     safe_model = model.replace(":", "-").replace("/", "-")
     return profiles_dir() / f"{role}-{safe_model}.json"
 
@@ -83,6 +149,7 @@ def create_profile(role: str, model: str) -> Dict[str, Any]:
     return {
         "role": role,
         "model": model,
+        "machine": machine_slug(),
         "samples": 0,
         "successes": 0,
         "failures": 0,
@@ -115,11 +182,17 @@ def _refresh_card(card: Dict[str, Any]) -> None:
         )
         entry["trusted"] = type_samples >= MIN_SAMPLES_PER_TYPE
     # A card is trusted only when every probe task type has
-    # enough samples. "general" runs do not count toward trust:
-    # they are unclassified work, not a measured task type.
-    card["trusted"] = all(
-        card["per_task_type"][task_type]["samples"] >= MIN_SAMPLES_PER_TYPE
-        for task_type in PROBE_TASK_TYPES
+    # enough samples, and only while it is not stale. A retired
+    # card stays untrusted even if more runs land on it: its
+    # measurements are no longer the ones to route on.
+    # "general" runs do not count toward trust: they are
+    # unclassified work, not a measured task type.
+    card["trusted"] = (
+        not card["stale"]
+        and all(
+            card["per_task_type"][task_type]["samples"] >= MIN_SAMPLES_PER_TYPE
+            for task_type in PROBE_TASK_TYPES
+        )
     )
     ranked = [
         (task_type, entry)
@@ -133,37 +206,198 @@ def _refresh_card(card: Dict[str, Any]) -> None:
     card["last_updated"] = datetime.now(timezone.utc).isoformat()
 
 
-def _load_card(role: str, model: str) -> Dict[str, Any]:
-    """Load a card from disk, or a fresh one if none is stored."""
-    path = _card_path(role, model)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            card = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return create_profile(role, model)
-    if not isinstance(card, dict) or card.get("role") != role:
-        return create_profile(role, model)
-    # A card written by an older version may lack fields added
-    # since; fill the gaps from a fresh card instead of crashing.
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _normalize_card(card: Any, role: str, model: str) -> Optional[Dict[str, Any]]:
+    """Validate a loaded card and fill or replace bad fields.
+
+    A card written by an older version, or hand-edited into a bad
+    shape, must not crash profiling: missing or mistyped fields
+    are replaced with fresh defaults. A card whose stored role or
+    model does not match the file it was loaded for is rejected
+    outright: it belongs to another role or model. Returns None
+    when the card is not usable at all.
+    """
+    if not isinstance(card, dict):
+        return None
+    if card.get("role") != role or card.get("model") != model:
+        return None
     fresh = create_profile(role, model)
-    for key, value in fresh.items():
-        card.setdefault(key, value)
+    machine = card.get("machine")
+    # A card from before machine scoping has no machine field; it
+    # is adopted by the machine that first loads it.
+    card["machine"] = machine if isinstance(machine, str) and machine else machine_slug()
+    for key in ("samples", "successes", "failures"):
+        if not _is_int(card.get(key)):
+            card[key] = 0
+    for key in ("success_rate", "total_seconds", "avg_seconds"):
+        if not _is_number(card.get(key)):
+            card[key] = 0.0
+    per_type = card.get("per_task_type")
+    if not isinstance(per_type, dict):
+        per_type = {}
+        card["per_task_type"] = per_type
     for task_type in TASK_TYPES:
-        card["per_task_type"].setdefault(task_type, fresh["per_task_type"][task_type])
+        entry = per_type.get(task_type)
+        if not isinstance(entry, dict):
+            per_type[task_type] = fresh["per_task_type"][task_type]
+            continue
+        for key in ("samples", "successes", "failures"):
+            if not _is_int(entry.get(key)):
+                entry[key] = 0
+        for key in ("success_rate", "total_seconds", "avg_seconds"):
+            if not _is_number(entry.get(key)):
+                entry[key] = 0.0
+        if not isinstance(entry.get("trusted"), bool):
+            entry["trusted"] = False
+    modes = card.get("failure_modes")
+    if not isinstance(modes, dict) or not all(
+        isinstance(key, str) and _is_int(value) for key, value in modes.items()
+    ):
+        card["failure_modes"] = {}
+    for key in ("best_task_types", "worst_task_types"):
+        value = card.get(key)
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            card[key] = []
+    for key in ("trusted", "stale"):
+        if not isinstance(card.get(key), bool):
+            card[key] = False
+    if card.get("stale_reason") is not None and not isinstance(
+        card.get("stale_reason"), str
+    ):
+        card["stale_reason"] = None
+    if card.get("last_updated") is not None and not isinstance(
+        card.get("last_updated"), str
+    ):
+        card["last_updated"] = None
     return card
 
 
+def _load_card(role: str, model: str) -> Dict[str, Any]:
+    """Load a card from disk, or a fresh one if none is stored.
+
+    Tries the current machine-scoped filename first, then the
+    legacy filename from before machine scoping: a legacy card is
+    adopted by this machine and re-saved under the new name on
+    the next write, so the old file does not linger as a duplicate.
+    A malformed or mismatched card is replaced with a fresh one,
+    never raised.
+    """
+    path = _card_path(role, model)
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                card = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return create_profile(role, model)
+        normalized = _normalize_card(card, role, model)
+        return normalized if normalized is not None else create_profile(role, model)
+    legacy = _legacy_card_path(role, model)
+    if legacy.exists():
+        try:
+            with open(legacy, "r", encoding="utf-8") as f:
+                card = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return create_profile(role, model)
+        normalized = _normalize_card(card, role, model)
+        if normalized is not None:
+            return normalized
+    return create_profile(role, model)
+
+
+@contextlib.contextmanager
+def _card_lock(path: Path):
+    """Best-effort cross-process lock for one card's read-modify-write.
+
+    The in-process _LOCK only coordinates threads in this process;
+    two processes recording the same card would otherwise load the
+    same counts and one run would be lost. The lock is a file
+    created with O_EXCL: the first process wins, the other waits
+    briefly, and a lock older than 30 seconds is treated as stale
+    (its process died) and removed. If the lock cannot be taken
+    within 10 seconds, the update still runs rather than breaking
+    the swarm: profiling must never block work.
+    """
+    lock_path = path.with_suffix(".lock")
+    fd = None
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                try:
+                    if time.monotonic() - os.path.getmtime(lock_path) > 30.0:
+                        os.unlink(lock_path)
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.1)
+            except OSError:
+                # The lock file cannot be created at all (the
+                # profiles dir is missing or not writable):
+                # proceed without it rather than breaking
+                # the swarm. The save will report its own
+                # failure.
+                break
+        yield
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
+
+
 def _save_card(card: Dict[str, Any]) -> bool:
-    """Write a card to disk. Returns False instead of raising."""
+    """Write a card to disk. Returns False instead of raising.
+
+    The write goes to a unique temp file (no two processes share
+    a name) and is moved into place, so a reader never sees a
+    half-written card.
+    """
     try:
         directory = profiles_dir()
         directory.mkdir(parents=True, exist_ok=True)
         path = _card_path(card["role"], card["model"])
-        tmp_path = path.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(card, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.replace(tmp_path, path)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(directory), prefix=path.name + ".", suffix=".tmp"
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(card, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+        # A legacy card adopted by this machine is gone once the
+        # new file is in place; leaving it would list the same
+        # role + model twice.
+        legacy = _legacy_card_path(card["role"], card["model"])
+        if legacy != path:
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
         return True
     except (OSError, ValueError, TypeError):
         return False
@@ -172,7 +406,8 @@ def _save_card(card: Dict[str, Any]) -> bool:
 def get_profile(role: str, model: str) -> Optional[Dict[str, Any]]:
     """Return a stored card, or None if none exists yet."""
     path = _card_path(role, model)
-    if not path.exists():
+    legacy = _legacy_card_path(role, model)
+    if not path.exists() and not legacy.exists():
         return None
     with _LOCK:
         return _load_card(role, model)
@@ -193,8 +428,15 @@ def list_profiles() -> List[Dict[str, Any]]:
                     card = json.load(f)
             except (json.JSONDecodeError, OSError):
                 continue
-            if isinstance(card, dict) and card.get("role") and card.get("model"):
-                cards.append(card)
+            if not isinstance(card, dict):
+                continue
+            role = card.get("role")
+            model = card.get("model")
+            if not isinstance(role, str) or not isinstance(model, str):
+                continue
+            normalized = _normalize_card(card, role, model)
+            if normalized is not None:
+                cards.append(normalized)
     cards.sort(key=lambda c: (c["role"], c["model"]))
     return cards
 
@@ -205,6 +447,7 @@ def profiles_summary() -> List[Dict[str, Any]]:
         {
             "role": card["role"],
             "model": card["model"],
+            "machine": card.get("machine"),
             "samples": card["samples"],
             "trusted": card["trusted"],
             "success_rate": card["success_rate"],
@@ -222,7 +465,7 @@ def retire_profile(role: str, model: str, reason: str = "model changed") -> bool
     too old to trust. The card is kept on disk, not deleted, so
     the history stays reviewable. Returns False if no card exists.
     """
-    with _LOCK:
+    with _LOCK, _card_lock(_card_path(role, model)):
         card = _load_card(role, model)
         if card["samples"] == 0 and card["last_updated"] is None:
             return False
@@ -241,7 +484,10 @@ def classify_result(response: Any, error: Optional[str] = None) -> Tuple[bool, O
     or came back as an "Error: ..." string, an empty response, and
     an "UNCERTAIN" answer (the grounded model refusing for lack
     of context). The timeout kind is split out of the error kind
-    because a timeout is a different problem than a bad response.
+    because a timeout is a different problem than a bad response:
+    the wording is checked in both the error argument and in an
+    "Error: ..." response string, since a timeout can arrive
+    through either one.
     """
     if error is not None:
         lowered = str(error).lower()
@@ -252,6 +498,9 @@ def classify_result(response: Any, error: Optional[str] = None) -> Tuple[bool, O
         return False, "empty"
     stripped = response.strip()
     if stripped.startswith("Error:"):
+        lowered = stripped.lower()
+        if "timeout" in lowered or "timed out" in lowered:
+            return False, "timeout"
         return False, "error"
     if stripped == "UNCERTAIN" or stripped.startswith("UNCERTAIN"):
         return False, "uncertain"
@@ -295,7 +544,10 @@ def record_profile_run(
     Loads the card, adds the run, recomputes its derived
     fields, and writes it back to profiles/. Never raises on
     bad input or a failed write: returns False instead, so a
-    swarm is never broken by its own profiling.
+    swarm is never broken by its own profiling. The load and
+    the write happen under a cross-process file lock, so two
+    processes recording the same card cannot lose each other's
+    runs.
     """
     try:
         if not role or not model:
@@ -305,7 +557,7 @@ def record_profile_run(
         return False
     if task_type not in TASK_TYPES:
         task_type = "general"
-    with _LOCK:
+    with _LOCK, _card_lock(_card_path(role, model)):
         card = _load_card(role, model)
         card["samples"] += 1
         if success:

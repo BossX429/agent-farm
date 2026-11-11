@@ -29,6 +29,7 @@ from agent_farm.profiles import (
     create_profile,
     get_profile,
     list_profiles,
+    machine_slug,
     profiles_summary,
     record_profile_run,
     retire_profile,
@@ -138,8 +139,9 @@ def test_card_survives_reload_from_disk(monkeypatch, tmp_path):
     assert card["successes"] == 1
     assert card["failures"] == 1
     assert card["per_task_type"]["list"]["samples"] == 2
-    path = tmp_path / "scout-qwen3-4b.json"
-    assert path.exists()
+    paths = sorted(tmp_path.glob("scout-qwen3-4b-*.json"))
+    assert len(paths) == 1
+    path = paths[0]
     stored = json.loads(path.read_text(encoding="utf-8"))
     assert stored["role"] == "scout"
     assert stored["failure_modes"] == {"uncertain": 1}
@@ -188,6 +190,8 @@ def test_classify_result():
     assert classify_result("   ") == (False, "empty")
     assert classify_result(None) == (False, "empty")
     assert classify_result(None, "Error: timed out") == (False, "timeout")
+    assert classify_result("Error: request timed out") == (False, "timeout")
+    assert classify_result("Error: timed out after 120s") == (False, "timeout")
     assert classify_result(None, "boom") == (False, "error")
     assert classify_result("ok", "Error: 500") == (False, "error")
 
@@ -387,6 +391,7 @@ def test_farm_stats_includes_profiles(monkeypatch, tmp_path):
     assert stats["profiles"] == [{
         "role": "worker",
         "model": "qwen3:4b",
+        "machine": machine_slug(),
         "samples": 1,
         "trusted": False,
         "success_rate": 1.0,
