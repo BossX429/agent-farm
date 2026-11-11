@@ -45,6 +45,14 @@ _LOCK = threading.Lock()
 _DATA: Dict[str, Dict[str, Any]] = {}
 _BUG_DATA: Dict[str, Dict[str, Any]] = {}
 
+# Bound on retained per-bug records. A long-running server creates
+# new bug ids on every colony spawn and nothing removes colonies, so
+# an unbounded store would grow for the process lifetime. Oldest
+# entries are dropped first. 1000 entries covers far more colonies
+# than a session holds (a colony has at most 8 bugs); a later phase
+# can persist or age entries out instead of dropping them.
+_MAX_BUG_ENTRIES = 1000
+
 
 def _entry(tool: str) -> Dict[str, Any]:
     entry = _DATA.setdefault(tool, {
@@ -131,6 +139,8 @@ def record_bug_run(
     success/failure). It never calls a model and never logs content.
     A bug id is unique to one colony spawn, so a later phase groups
     these runs by role and model, not by bug id alone.
+    Retained records are capped at _MAX_BUG_ENTRIES (oldest dropped
+    first) so a long-running server cannot grow this store forever.
     """
     try:
         if not bug_id:
@@ -146,6 +156,8 @@ def record_bug_run(
         else:
             entry["failures"] += 1
         entry["total_seconds"] += max(0.0, elapsed)
+        while len(_BUG_DATA) > _MAX_BUG_ENTRIES:
+            _BUG_DATA.pop(next(iter(_BUG_DATA)))
 
 
 def get_bug_metrics() -> Dict[str, Dict[str, Any]]:
