@@ -1,12 +1,13 @@
 """Colony core: bug/colony creation, routing, and parallel execution."""
 
 import os
+import time
 import uuid
 import json
 import httpx
 import asyncio
 from datetime import datetime
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .state import (
@@ -19,6 +20,7 @@ from .state import (
     stats,
 )
 from .ollama import sync_query_ollama
+from .metrics import record_bug_run
 
 
 def _unique_id(prefix: str) -> str:
@@ -117,9 +119,22 @@ def get_best_bug_for_task(task: Dict, colony: Colony) -> Bug:
     return colony.bugs[0]
 
 
+def _run_bug_query(bug: Bug, full_prompt: str) -> Tuple[str, float]:
+    """Run one bug's model call; report when the worker started it.
+
+    The start time is captured inside the worker thread, so time a
+    task spends queued in the executor is not counted as model time.
+    The model semaphore wait inside sync_query_ollama is still
+    included: that wait is part of the call itself. Uses a monotonic
+    clock, so system clock changes cannot corrupt the duration.
+    """
+    started = time.monotonic()
+    response = sync_query_ollama(bug.model, full_prompt)
+    return response, started
+
+
 def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[Dict]:
     """Execute tasks in TRUE PARALLEL using ThreadPoolExecutor"""
-    import time
     start = time.time()
     results = []
     # No tasks, or no bugs to run them: return without creating a
@@ -150,30 +165,60 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
             prompt = task.get("prompt", "")
             context = task.get("context", "")
             full_prompt = f"Context: {context}\n\nTask: {prompt}" if context else prompt
-            future = executor.submit(sync_query_ollama, bug.model, full_prompt)
-            futures[future] = (bug, task)
-        
+            future = executor.submit(_run_bug_query, bug, full_prompt)
+            futures[future] = (bug, task, time.monotonic())
+
         for future in as_completed(futures):
-            bug, task = futures[future]
+            bug, task, submitted = futures[future]
+            response = None
+            error = None
             try:
-                response = future.result()
+                response, started = future.result()
+            except Exception as e:
+                # The model call itself raised. sync_query_ollama
+                # normally returns an "Error: ..." string instead, so
+                # this path is the exception, not the rule. No worker
+                # start was recorded, so fall back to the submit time.
+                error = str(e)
+                started = submitted
+            # Profiler factory Phase 1: per-bug elapsed time and status.
+            # This only records what the run already knows; it does not
+            # change which bug was picked or what the bug returns.
+            # The unrounded duration is what gets recorded; only the
+            # result dict rounds it, so short runs are not lost.
+            elapsed = time.monotonic() - started
+            elapsed_seconds = round(elapsed, 2)
+            if error is None and isinstance(response, str) and response.strip().startswith("Error:"):
+                # sync_query_ollama returns an "Error: ..." string on
+                # a failed model call instead of raising, so a bare
+                # success check would count a failed call as a success.
+                # Same "Error:" convention as
+                # reliability._is_failed_fragment.
+                error = response
+                response = None
+            if error is None:
                 results.append({
                     "bug_id": bug.id,
                     "role": bug.role,
                     "model": bug.model,
                     "task": task.get("prompt", "")[:50],
                     "response": response,
-                    "status": "success"
+                    "status": "success",
+                    "elapsed_seconds": elapsed_seconds,
                 })
+                record_bug_run(bug.id, elapsed, True, role=bug.role, model=bug.model)
                 bug.status = "completed"
                 bug.last_task = task.get("prompt", "")[:50]
-            except Exception as e:
+            else:
                 results.append({
                     "bug_id": bug.id,
                     "role": bug.role,
-                    "error": str(e),
-                    "status": "failed"
+                    "model": bug.model,
+                    "error": error,
+                    "status": "failed",
+                    "elapsed_seconds": elapsed_seconds,
                 })
+                record_bug_run(bug.id, elapsed, False, role=bug.role, model=bug.model)
     
     elapsed = time.time() - start
     colony.tasks_completed += len(tasks)
