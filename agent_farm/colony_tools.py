@@ -9,8 +9,10 @@ from datetime import datetime
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from . import probes
 from .mcp_app import mcp
 from .metrics import track_tool_run
+from .profiles import profiles_summary
 from .state import MODEL_TIERS, OLLAMA_URL, colonies, stats
 from .colony import (
     spawn_colony_internal,
@@ -25,20 +27,42 @@ from .reliability import validate_parallel_items, validate_parallel_payload
 
 @mcp.tool()
 @track_tool_run()
-async def spawn_colony(colony_type: str = "standard") -> dict:
+async def spawn_colony(colony_type: str = "standard", run_probes: bool = True) -> dict:
     """
     Spawn a new bug colony. Types: standard, fast, heavy, hybrid
     - standard: scout, worker, worker, memory
     - fast: scout, scout, worker, worker (speed)
     - heavy: memory, memory, learner, guardian (power)
     - hybrid: all roles balanced
+
+    Profiler factory Phase 2: unless run_probes is False, the
+    probe harness runs automatically after the spawn, one
+    representative bug per role + model, and the results land
+    on the profile cards in profiles/. Probing costs extra
+    model calls and time before the colony can do real work,
+    and a probe run that fails (Ollama down, for example) is
+    recorded as failed probes, never as a failed spawn.
     """
     colony = spawn_colony_internal(colony_type)
+    probe_summary = None
+    if run_probes:
+        try:
+            probe_results = await asyncio.to_thread(probes.run_probes, colony)
+            probe_summary = probes.summarize_probe_results(probe_results)
+        except Exception:
+            probe_summary = {
+                "probed": 0,
+                "successes": 0,
+                "failures": 0,
+                "elapsed_seconds": 0.0,
+                "error": "probe run failed",
+            }
     return {
         "colony_id": colony.id,
         "type": colony_type,
         "bugs": [{"id": b.id, "role": b.role, "model": b.model} for b in colony.bugs],
-        "created": colony.created
+        "created": colony.created,
+        "probes": probe_summary,
     }
 
 
@@ -80,10 +104,16 @@ async def deploy_swarm(colony_id: str, tasks: str) -> dict:
 
 @mcp.tool()
 @track_tool_run()
-async def quick_swarm(tasks: str, colony_type: str = "fast") -> dict:
+async def quick_swarm(tasks: str, colony_type: str = "fast", run_probes: bool = True) -> dict:
     """
     One-shot: spawn colony + deploy swarm + return results
     tasks: JSON array or single prompt string
+
+    Profiler factory Phase 2: unless run_probes is False, the
+    probe harness runs automatically after the spawn and before
+    the tasks, and the results land on the profile cards in
+    profiles/. Probing costs extra model calls and time before
+    the tasks run.
     """
     payload_error = validate_parallel_payload(tasks, "tasks")
     if payload_error:
@@ -99,12 +129,27 @@ async def quick_swarm(tasks: str, colony_type: str = "fast") -> dict:
     if items_error:
         return {"error": items_error}
 
+    probe_summary = None
+    if run_probes:
+        try:
+            probe_results = await asyncio.to_thread(probes.run_probes, colony)
+            probe_summary = probes.summarize_probe_results(probe_results)
+        except Exception:
+            probe_summary = {
+                "probed": 0,
+                "successes": 0,
+                "failures": 0,
+                "elapsed_seconds": 0.0,
+                "error": "probe run failed",
+            }
+
     results = await asyncio.to_thread(execute_parallel_swarm, task_list, colony)
     
     return {
         "colony_id": colony.id,
         "tasks": len(task_list),
-        "results": results
+        "results": results,
+        "probes": probe_summary,
     }
 
 
@@ -260,6 +305,10 @@ async def farm_stats() -> dict:
             "swarm and colony tools with counts/durations only; "
             "read-only tools not counted"
         ),
+        # Profiler factory Phase 2: one summary line per stored
+        # profile card (role, model, samples, trusted, success
+        # rate, avg seconds). Full cards live in profiles/.
+        "profiles": profiles_summary(),
         "observability": {
             "action_log": _action_log_summary(),
         },
