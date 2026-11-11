@@ -72,6 +72,28 @@ def _fake_boom(model, prompt):
     raise RuntimeError("boom")
 
 
+import threading
+
+_concurrency = {"active": 0, "peak": 0}
+_concurrency_lock = threading.Lock()
+
+
+def _fake_counting(model, prompt):
+    # Tracks how many fake calls run at once, to prove the
+    # probe pool never exceeds the model semaphore size.
+    with _concurrency_lock:
+        _concurrency["active"] += 1
+        _concurrency["peak"] = max(
+            _concurrency["peak"], _concurrency["active"]
+        )
+    try:
+        time.sleep(_FAKE_DELAY)
+        return "ok"
+    finally:
+        with _concurrency_lock:
+            _concurrency["active"] -= 1
+
+
 def _profile_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_FARM_PROFILES_DIR", str(tmp_path))
 
@@ -217,6 +239,26 @@ def test_run_probes_error_string_is_failure(monkeypatch, tmp_path):
     card = get_profile("worker", "qwen3:4b")
     assert card["failures"] == 5
     assert card["failure_modes"] == {"error": 5}
+
+
+def test_run_probes_never_exceed_model_concurrency(monkeypatch, tmp_path):
+    from agent_farm.reliability import MAX_MODEL_CONCURRENCY
+
+    _profile_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _fake_counting)
+    _concurrency["active"] = 0
+    _concurrency["peak"] = 0
+    colony = spawn_colony_internal("standard")
+    results = run_probes(colony)
+    assert len(results) == 15
+    assert all(r["status"] == "success" for r in results)
+    # The pool is capped at the model semaphore size, so no
+    # probe waits for a slot with its clock running. The old
+    # pool of 8 peaked at 8 here; the cap must hold at 4.
+    assert _concurrency["peak"] <= MAX_MODEL_CONCURRENCY
+    # ...and the cap must not have serialized the run: probes
+    # still overlap.
+    assert _concurrency["peak"] >= 2
 
 
 def test_run_probes_uncertain_is_failure(monkeypatch, tmp_path):

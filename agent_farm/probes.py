@@ -26,6 +26,7 @@ from typing import Any, Dict, List
 
 from .ollama import sync_query_ollama
 from .profiles import classify_result, record_profile_run
+from .reliability import MAX_MODEL_CONCURRENCY
 from .state import Colony
 
 # One job per task type. Each job's context is the whole job:
@@ -104,7 +105,19 @@ def run_probes(colony: Colony) -> List[Dict[str, Any]]:
 
     jobs = [(bug, job) for bug in representatives for job in PROBE_JOBS]
     results: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=max(1, min(len(jobs), 8))) as executor:
+    # One worker per model slot (MAX_MODEL_CONCURRENCY, the same
+    # size as the semaphore in reliability.py). A bigger pool only
+    # parks extra workers inside sync_query_ollama waiting for a
+    # semaphore slot, with their clocks already running, so their
+    # recorded times include the wait -- that was the 14-110s
+    # spread on the first real run. With the pool matched to the
+    # semaphore, a job waits in the executor queue instead, where
+    # its clock has not started yet, and the recorded time is pure
+    # model time. Wall time does not change: throughput is bounded
+    # by the semaphore either way.
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(len(jobs), MAX_MODEL_CONCURRENCY))
+    ) as executor:
         futures = {}
         for bug, job in jobs:
             future = executor.submit(_run_one_probe, bug, job)
