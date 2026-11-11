@@ -449,3 +449,299 @@ def test_record_never_raises_on_bad_input(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_FARM_PROFILES_DIR", str(tmp_path / "a-file"))
     (tmp_path / "a-file").write_text("not a dir", encoding="utf-8")
     assert record_profile_run("worker", "qwen3:4b", "write", 0.1, True) is False
+
+
+def test_malformed_card_is_normalized(monkeypatch, tmp_path):
+    # A card with wrong types and missing fields must load as a
+    # usable card, not crash the reader.
+    from agent_farm.profiles import _card_path
+
+    _profile_dir(monkeypatch, tmp_path)
+    path = _card_path("worker", "qwen3:4b")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "role": "worker",
+        "model": "qwen3:4b",
+        "samples": "five",
+        "successes": True,
+        "total_seconds": "fast",
+        "per_task_type": {"write": {"samples": "three"}},
+        "failure_modes": {"error": "many"},
+        "trusted": "yes",
+        "stale_reason": 42,
+    }), encoding="utf-8")
+    card = get_profile("worker", "qwen3:4b")
+    assert card is not None
+    assert card["samples"] == 0
+    assert card["successes"] == 0
+    assert card["total_seconds"] == 0.0
+    assert card["per_task_type"]["write"]["samples"] == 0
+    assert card["per_task_type"]["search"]["samples"] == 0
+    assert card["failure_modes"] == {}
+    assert card["trusted"] is False
+    assert card["stale_reason"] is None
+    # And a run still records on the repaired card.
+    assert record_profile_run("worker", "qwen3:4b", "write", 0.1, True) is True
+    assert get_profile("worker", "qwen3:4b")["samples"] == 1
+
+
+def test_mismatched_card_is_rejected(monkeypatch, tmp_path):
+    # A card whose stored model is not the one the file is for
+    # belongs to another model: it is replaced, not mixed in.
+    from agent_farm.profiles import _card_path
+
+    _profile_dir(monkeypatch, tmp_path)
+    path = _card_path("worker", "qwen3:4b")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "role": "worker", "model": "other-model", "samples": 99,
+    }), encoding="utf-8")
+    assert get_profile("worker", "qwen3:4b")["samples"] == 0
+
+
+def test_models_with_same_normalized_name_get_separate_cards(monkeypatch, tmp_path):
+    # "qwen3:4b" and "qwen3-4b" normalize to the same string, but
+    # they are different models and must not share a card.
+    _profile_dir(monkeypatch, tmp_path)
+    record_profile_run("worker", "qwen3:4b", "write", 0.1, True)
+    record_profile_run("worker", "qwen3-4b", "write", 0.2, True)
+    card_a = get_profile("worker", "qwen3:4b")
+    card_b = get_profile("worker", "qwen3-4b")
+    assert card_a["samples"] == 1
+    assert card_b["samples"] == 1
+    assert card_a["avg_seconds"] == 0.1
+    assert card_b["avg_seconds"] == 0.2
+    assert len(list_profiles()) == 2
+
+
+def test_card_records_machine_and_legacy_card_is_adopted(monkeypatch, tmp_path):
+    # A card records the machine that measured it, and a card
+    # written before machine scoping is adopted by the machine
+    # that first loads it, then re-saved under the new name.
+    from agent_farm.profiles import _legacy_card_path, machine_slug
+
+    _profile_dir(monkeypatch, tmp_path)
+    legacy = _legacy_card_path("worker", "qwen3:4b")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps({
+        "role": "worker", "model": "qwen3:4b", "samples": 3,
+        "successes": 3, "failures": 0, "success_rate": 1.0,
+        "total_seconds": 0.3, "avg_seconds": 0.1,
+        "per_task_type": {},
+        "failure_modes": {}, "best_task_types": [], "worst_task_types": [],
+        "trusted": False, "stale": False, "stale_reason": None,
+        "last_updated": None,
+    }), encoding="utf-8")
+    card = get_profile("worker", "qwen3:4b")
+    assert card["samples"] == 3
+    assert card["machine"] == machine_slug()
+    # Recording a run re-saves under the new name and removes
+    # the legacy file, so the card is not listed twice.
+    assert record_profile_run("worker", "qwen3:4b", "write", 0.1, True) is True
+    assert not legacy.exists()
+    assert len(list_profiles()) == 1
+    assert list_profiles()[0]["samples"] == 4
+
+
+def test_retired_card_stays_untrusted_after_more_runs(monkeypatch, tmp_path):
+    # A retired card must not become trusted again just because
+    # more runs land on it.
+    _profile_dir(monkeypatch, tmp_path)
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
+    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+    assert retire_profile("worker", "qwen3:4b", "model changed") is True
+    for _ in range(MIN_SAMPLES_PER_TYPE):
+        record_profile_run("worker", "qwen3:4b", "write", 0.1, True)
+    card = get_profile("worker", "qwen3:4b")
+    assert card["stale"] is True
+    assert card["trusted"] is False
+
+
+def test_probe_clock_excludes_semaphore_wait(monkeypatch, tmp_path):
+    # Hold every model slot, then release them after 0.5s. A probe
+    # waits for a slot with its clock stopped, so the recorded
+    # time is just the fake call time, not the 0.5s wait.
+    from agent_farm.reliability import MODEL_SEMAPHORE
+
+    _profile_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _fake_ok)
+    colony = spawn_colony_internal("standard")
+    for _ in range(4):
+        MODEL_SEMAPHORE.acquire()
+
+    def release_all():
+        for _ in range(4):
+            try:
+                MODEL_SEMAPHORE.release()
+            except ValueError:
+                pass
+
+    timer = threading.Timer(0.5, release_all)
+    timer.start()
+    try:
+        results = run_probes(colony)
+    finally:
+        timer.cancel()
+        release_all()
+    assert len(results) == 15
+    for result in results:
+        assert result["elapsed_seconds"] < 0.3
+
+
+def test_probe_run_returns_within_budget(monkeypatch, tmp_path):
+    # A model that answers slowly must not hold a spawn hostage:
+    # the run returns within the wall budget and reports the
+    # unfinished jobs as incomplete.
+    _profile_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(probes_module, "PROBE_WALL_BUDGET_SECONDS", 0.5)
+
+    def _fake_slow(model, prompt, **kwargs):
+        time.sleep(5.0)
+        return "ok"
+
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _fake_slow)
+    colony = spawn_colony_internal("standard")
+    started = time.monotonic()
+    results = run_probes(colony)
+    wall = time.monotonic() - started
+    assert wall < 3.0
+    summary = summarize_probe_results(results)
+    assert summary["incomplete"] > 0
+    assert summary["probed"] + summary["incomplete"] == 15
+
+
+def test_failed_profile_save_is_reported(monkeypatch, tmp_path):
+    # A profiles dir that cannot be written: the swarm and probe
+    # results say profile_saved False, and the summary counts it,
+    # instead of the failure going unnoticed.
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a dir", encoding="utf-8")
+    monkeypatch.setenv("AGENT_FARM_PROFILES_DIR", str(blocker))
+    assert record_profile_run("worker", "qwen3:4b", "write", 0.1, True) is False
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _fake_ok)
+    colony = spawn_colony_internal("standard")
+    results = run_probes(colony)
+    assert results
+    assert all(r["profile_saved"] is False for r in results)
+    assert summarize_probe_results(results)["profile_save_failures"] == len(results)
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
+    swarm_results = execute_parallel_swarm([{"prompt": "write a file"}], colony)
+    assert swarm_results[0]["profile_saved"] is False
+
+
+def test_tool_swarm_run_feeds_card(monkeypatch, tmp_path):
+    # Real tool-swarm work lands on the bug's profile card, with
+    # the elapsed time of the whole agent run.
+    import agent_farm.agent as agent_module
+    from agent_farm.agent import run_tool_swarm
+
+    _profile_dir(monkeypatch, tmp_path)
+
+    def _fake_agent(role, model, task, context="", deep=False):
+        return {
+            "answer": "done", "tool_calls": [],
+            "iterations": 1, "status": "completed", "mode": "test",
+        }
+
+    monkeypatch.setattr(agent_module, "run_tool_agent", _fake_agent)
+    colony = spawn_colony_internal("hybrid")
+    results = run_tool_swarm([{"prompt": "list files in the folder"}], colony.bugs)
+    assert len(results) == 1
+    assert results[0]["profile_saved"] is True
+    assert results[0]["elapsed_seconds"] >= 0.0
+    card = get_profile("scout", "qwen3:4b")
+    assert card is not None
+    assert card["samples"] == 1
+    assert card["successes"] == 1
+    assert card["per_task_type"]["list"]["samples"] == 1
+
+
+def test_router_prefers_trusted_card(monkeypatch, tmp_path):
+    # A trusted card for the task type picks the bug that earned
+    # it, even when the keyword default would pick another bug
+    # of the same role.
+    from agent_farm.colony import get_best_bug_for_task
+
+    _profile_dir(monkeypatch, tmp_path)
+    colony = spawn_colony_internal("standard")
+    workers = [b for b in colony.bugs if b.role == "worker"]
+    assert len(workers) == 2
+    # No cards yet: the keyword default picks the first worker.
+    assert get_best_bug_for_task({"prompt": "write a file"}, colony).id == workers[0].id
+    # Give the SECOND worker a trusted card for every task type.
+    workers[1].model = "qwen2.5:14b"
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("worker", "qwen2.5:14b", task_type, 0.1, True)
+    assert get_profile("worker", "qwen2.5:14b")["trusted"] is True
+    picked = get_best_bug_for_task({"prompt": "write a file"}, colony)
+    assert picked.id == workers[1].id
+
+
+def test_router_search_goes_to_memory(monkeypatch, tmp_path):
+    # The shared taxonomy: a "search" prompt routes to memory,
+    # the same bucket the profiler records it in.
+    from agent_farm.colony import get_best_bug_for_task
+
+    _profile_dir(monkeypatch, tmp_path)
+    colony = spawn_colony_internal("hybrid")
+    picked = get_best_bug_for_task({"prompt": "search the knowledge base"}, colony)
+    assert picked.role == "memory"
+
+
+def test_cancelled_spawn_removes_colony(monkeypatch, tmp_path):
+    # Cancelling a spawn while probes are running must not leave
+    # an orphan colony nobody can reach by id.
+    from agent_farm.state import colonies
+
+    _profile_dir(monkeypatch, tmp_path)
+
+    def _fake_slow(model, prompt, **kwargs):
+        time.sleep(1.5)
+        return "ok"
+
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _fake_slow)
+    before = set(colonies)
+
+    async def main():
+        task = asyncio.create_task(server.spawn_colony("fast"))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        # Let the probe threads finish so the test does not end
+        # while they are still writing to the profiles dir.
+        await asyncio.sleep(2.0)
+
+    asyncio.run(main())
+    assert set(colonies) == before
+
+
+def test_concurrent_processes_do_not_lose_runs(monkeypatch, tmp_path):
+    # Two processes recording the same card at once must not lose
+    # each other's runs: the file lock serializes them.
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    _profile_dir(monkeypatch, tmp_path)
+    root = Path(__file__).resolve().parent.parent
+    code = (
+        "import sys; sys.path.insert(0, %r);"
+        "from agent_farm.profiles import record_profile_run;"
+        "[record_profile_run('worker', 'qwen3:4b', 'write', 0.1, True) for _ in range(3)]"
+    ) % str(root)
+    env = dict(os.environ, AGENT_FARM_PROFILES_DIR=str(tmp_path))
+    procs = [
+        subprocess.Popen([sys.executable, "-c", code], env=env, cwd=str(root))
+        for _ in range(2)
+    ]
+    for proc in procs:
+        assert proc.wait(timeout=60) == 0
+    card = get_profile("worker", "qwen3:4b")
+    assert card["samples"] == 6
