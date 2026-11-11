@@ -20,10 +20,11 @@ import time
 
 import pytest
 
-# The running Python, with forward slashes: tool_exec_cmd parses
-# commands with shlex (POSIX mode), which would eat the backslashes
-# in a Windows path. Forward slashes work for CreateProcess too.
-PY = sys.executable.replace("\\", "/")
+# The running Python, quoted and with forward slashes: tool_exec_cmd
+# parses commands with shlex (POSIX mode), which would eat the
+# backslashes in a Windows path, and an unquoted path with spaces
+# would split into fragments. Forward slashes work for CreateProcess.
+PY = '"' + sys.executable.replace("\\", "/") + '"'
 
 from agent_farm import reliability
 from agent_farm.reliability import (

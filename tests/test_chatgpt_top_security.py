@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -26,10 +27,11 @@ import pytest
 
 from agent_farm import tools
 
-# The running Python, with forward slashes: tool_exec_cmd parses
-# commands with shlex (POSIX mode), which would eat the backslashes
-# in a Windows path. Forward slashes work for CreateProcess too.
-PY = sys.executable.replace("\\", "/")
+# The running Python, quoted and with forward slashes: tool_exec_cmd
+# parses commands with shlex (POSIX mode), which would eat the
+# backslashes in a Windows path, and an unquoted path with spaces
+# would split into fragments. Forward slashes work for CreateProcess.
+PY = '"' + sys.executable.replace("\\", "/") + '"'
 
 
 # ---------- helpers ----------
@@ -244,6 +246,37 @@ def test_safe_pipeline_runs_without_shell():
     )
     assert result.get("returncode") == 0
     assert result["stdout"].strip() == "HELLO"
+
+
+def test_exec_cmd_never_uses_a_shell(monkeypatch):
+    # The pipeline test above would still pass if tool_exec_cmd
+    # regressed to shell=True (a shell runs these Python pipelines
+    # fine), so this test watches the launcher itself: every process
+    # the exec path spawns must be launched with shell=False.
+    # This test must FAIL if the code is changed to shell=True --
+    # that is its whole job, so it is checked that way, not just by
+    # watching it pass.
+    calls = []
+    real_popen = subprocess.Popen
+    real_run = subprocess.run
+
+    def recording_popen(*args, **kwargs):
+        calls.append(("Popen", kwargs))
+        return real_popen(*args, **kwargs)
+
+    def recording_run(*args, **kwargs):
+        calls.append(("run", kwargs))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    assert tools.tool_exec_cmd(f"{PY} -c \"print('hello')\"")["returncode"] == 0
+    assert tools.tool_exec_cmd(
+        f"{PY} -c \"print('hello')\" | {PY} -c "
+        "\"print(__import__('sys').stdin.read().upper().strip())\""
+    )["returncode"] == 0
+    assert calls, "expected the exec path to launch processes"
+    assert all(kwargs.get("shell") is False for _, kwargs in calls)
 
 
 def test_pipeline_blocked_stage_does_not_run(tmp_path):

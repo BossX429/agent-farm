@@ -11,10 +11,11 @@ import sys
 
 from agent_farm.server import exec_swarm, api_swarm
 
-# The running Python, with forward slashes: tool_exec_cmd parses
-# commands with shlex (POSIX mode), which would eat the backslashes
-# in a Windows path. Forward slashes work for CreateProcess too.
-PY = sys.executable.replace("\\", "/")
+# The running Python, quoted and with forward slashes: tool_exec_cmd
+# parses commands with shlex (POSIX mode), which would eat the
+# backslashes in a Windows path, and an unquoted path with spaces
+# would split into fragments. Forward slashes work for CreateProcess.
+PY = '"' + sys.executable.replace("\\", "/") + '"'
 
 
 def run(coro):
