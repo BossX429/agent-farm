@@ -21,6 +21,7 @@ from .state import (
 )
 from .ollama import sync_query_ollama
 from .metrics import record_bug_run
+from .profiles import classify_result, record_profile_run, task_type_for_prompt
 
 
 def _unique_id(prefix: str) -> str:
@@ -219,6 +220,23 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                     "elapsed_seconds": elapsed_seconds,
                 })
                 record_bug_run(bug.id, elapsed, False, role=bug.role, model=bug.model)
+            # Profiler factory Phase 2: feed the run into the bug's
+            # profile card. A card counts a run as a success only
+            # when it produced a usable answer, so this uses
+            # classify_result, not the call outcome above: a call
+            # that completed but answered UNCERTAIN counts as a
+            # success in the per-bug metrics and as a failure of
+            # kind "uncertain" on the card. record_profile_run
+            # never raises, so profiling cannot break the swarm.
+            card_success, failure_kind = classify_result(response, error)
+            record_profile_run(
+                bug.role,
+                bug.model,
+                task_type_for_prompt(task.get("prompt", "")),
+                elapsed,
+                card_success,
+                failure_kind,
+            )
     
     elapsed = time.time() - start
     colony.tasks_completed += len(tasks)
