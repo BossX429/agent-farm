@@ -8,6 +8,7 @@ Agent Farm v3.4 - Structured Output Edition
 
 import json
 import re
+import time
 import httpx
 from typing import Dict, List, Optional, Any
 from .tools import (
@@ -798,14 +799,33 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                 task.get("prompt", ""),
                 task.get("context", ""),
                 deep=deep
-            ): (bug, task)
+            ): (bug, task, time.monotonic())
             for bug, task in bug_assignments
         }
-        
+
         for future in as_completed(futures):
-            bug, task = futures[future]
+            bug, task, started = futures[future]
+            # Profiler factory: tool-swarm work is real work, so it
+            # feeds the bug's profile card too. The elapsed time
+            # covers the whole agent run (model calls plus tool
+            # calls), not just the model time. Direct-execute tasks
+            # (model "none") and no-bug failures never reach this
+            # loop, so they are not recorded: no model ran for them.
             try:
                 result = future.result()
+                elapsed = time.monotonic() - started
+                card_success, failure_kind = classify_result(result["answer"])
+                if result["status"] != "completed":
+                    card_success = False
+                    failure_kind = failure_kind or "error"
+                saved = record_profile_run(
+                    bug.role,
+                    bug.model,
+                    task_type_for_prompt(task.get("prompt", "")),
+                    elapsed,
+                    card_success,
+                    failure_kind,
+                )
                 results.append({
                     "bug_id": bug.id,
                     "role": bug.role,
@@ -815,14 +835,27 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                     "tool_calls": len(result["tool_calls"]),
                     "iterations": result["iterations"],
                     "status": result["status"],
-                    "mode": result.get("mode", "unknown")
+                    "mode": result.get("mode", "unknown"),
+                    "elapsed_seconds": round(elapsed, 2),
+                    "profile_saved": saved,
                 })
             except Exception as e:
+                elapsed = time.monotonic() - started
+                saved = record_profile_run(
+                    bug.role,
+                    bug.model,
+                    task_type_for_prompt(task.get("prompt", "")),
+                    elapsed,
+                    False,
+                    "error",
+                )
                 results.append({
                     "bug_id": bug.id,
                     "role": bug.role,
                     "error": str(e),
-                    "status": "failed"
+                    "status": "failed",
+                    "elapsed_seconds": round(elapsed, 2),
+                    "profile_saved": saved,
                 })
-    
+
     return results

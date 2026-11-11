@@ -42,31 +42,31 @@ _FAKE_DELAY = 0.05
 _MIN_ELAPSED = 0.04
 
 
-def _fake_ok(model, prompt):
+def _fake_ok(model, prompt, **kwargs):
     time.sleep(_FAKE_DELAY)
     return "def add(a, b):\n    return a + b"
 
 
-def _fake_error(model, prompt):
+def _fake_error(model, prompt, **kwargs):
     # Matches the real sync_query_ollama: a failed model call
     # comes back as an "Error: ..." string, not an exception.
     time.sleep(_FAKE_DELAY)
     return "Error: 500"
 
 
-def _fake_uncertain(model, prompt):
+def _fake_uncertain(model, prompt, **kwargs):
     # Matches the real grounded helper: no usable context in
     # the prompt, so the model answers UNCERTAIN.
     time.sleep(_FAKE_DELAY)
     return "UNCERTAIN"
 
 
-def _fake_empty(model, prompt):
+def _fake_empty(model, prompt, **kwargs):
     time.sleep(_FAKE_DELAY)
     return "   "
 
 
-def _fake_boom(model, prompt):
+def _fake_boom(model, prompt, **kwargs):
     # Safety net only: the real helper returns an Error string
     # instead of raising, so this path should never fire live.
     time.sleep(_FAKE_DELAY)
@@ -79,7 +79,7 @@ _concurrency = {"active": 0, "peak": 0}
 _concurrency_lock = threading.Lock()
 
 
-def _fake_counting(model, prompt):
+def _fake_counting(model, prompt, **kwargs):
     # Tracks how many fake calls run at once, to prove the
     # probe pool never exceeds the model semaphore size.
     with _concurrency_lock:
@@ -409,14 +409,33 @@ def test_summarize_probe_results():
         "probed": 2,
         "successes": 1,
         "failures": 1,
+        "incomplete": 0,
         "elapsed_seconds": 0.3,
+        "total_call_seconds": 0.3,
+        "profile_save_failures": 0,
     }
     assert summarize_probe_results([]) == {
         "probed": 0,
         "successes": 0,
         "failures": 0,
+        "incomplete": 0,
         "elapsed_seconds": 0.0,
+        "total_call_seconds": 0.0,
+        "profile_save_failures": 0,
     }
+
+
+def test_summarize_uses_wall_time_not_call_sum():
+    # Two overlapping calls: each took 0.5s, but they ran at the
+    # same time, so the run took 0.5s, not 1.0s.
+    results = [
+        {"status": "success", "elapsed_seconds": 0.5, "started_monotonic": 10.0, "profile_saved": True},
+        {"status": "success", "elapsed_seconds": 0.5, "started_monotonic": 10.0, "profile_saved": True},
+    ]
+    summary = summarize_probe_results(results)
+    assert summary["elapsed_seconds"] == 0.5
+    assert summary["total_call_seconds"] == 1.0
+    assert summary["profile_save_failures"] == 0
 
 
 def test_record_never_raises_on_bad_input(monkeypatch, tmp_path):
