@@ -31,6 +31,7 @@ from agent_farm.metrics import (
     record_bug_run,
     reset_metrics,
 )
+from agent_farm.state import MODEL_TIERS
 
 # Known delay in the fakes, and the smallest part of it a timing
 # assertion will accept (sleep is a minimum, so this has margin).
@@ -83,7 +84,7 @@ def test_swarm_results_carry_elapsed_seconds_and_status(monkeypatch):
         assert entry["failures"] == 0
         assert entry["avg_seconds"] >= _MIN_ELAPSED
         assert entry["role"] in ("scout", "worker", "memory", "guardian", "learner")
-        assert entry["model"] == "qwen3:4b"
+        assert entry["model"] == MODEL_TIERS[entry["role"]]
         # No token cost is ever invented, same rule as tool metrics.
         assert "tokens" not in entry
         assert "token_cost" not in entry

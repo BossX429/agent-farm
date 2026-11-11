@@ -35,6 +35,7 @@ from agent_farm.profiles import (
     retire_profile,
     task_type_for_prompt,
 )
+from agent_farm.state import MODEL_TIERS
 
 # Known delay in the fakes, and the smallest part of it a timing
 # assertion will accept (sleep is a minimum, so this has margin).
@@ -205,6 +206,53 @@ def test_task_type_for_prompt():
     assert task_type_for_prompt("do something vague") == "general"
 
 
+def test_mixed_model_roles_are_distinct():
+    # Roles deliberately run different models: the code-facing
+    # roles (worker writes code, learner analyzes it) use the
+    # code-tuned model, the fast roles stay on qwen3:4b, and the
+    # synthesizer keeps qwen2.5:14b. If every role ran the same
+    # model, the profiler would measure timing noise between
+    # identical workers instead of real differences.
+    assert MODEL_TIERS["worker"] == "qwen2.5-coder:7b-v8-review"
+    assert MODEL_TIERS["learner"] == "qwen2.5-coder:7b-v8-review"
+    assert MODEL_TIERS["scout"] == "qwen3:4b"
+    assert MODEL_TIERS["memory"] == "qwen3:4b"
+    assert MODEL_TIERS["guardian"] == "qwen3:4b"
+    assert MODEL_TIERS["synthesizer"] == "qwen2.5:14b"
+    # At least two different models are actually in use.
+    assert len(set(MODEL_TIERS.values())) >= 3
+
+
+def test_live_colony_bugs_carry_their_role_model(monkeypatch, tmp_path):
+    # A spawned colony's bugs carry the model their role is
+    # configured for, so the profiler's per-role+model cards
+    # measure the model that actually ran.
+    _profile_dir(monkeypatch, tmp_path)
+    colony = spawn_colony_internal("standard")
+    assert len(colony.bugs) > 0
+    for bug in colony.bugs:
+        assert bug.model == MODEL_TIERS[bug.role], bug.role
+    # The standard colony has both models in it.
+    models = {bug.model for bug in colony.bugs}
+    assert "qwen3:4b" in models
+    assert "qwen2.5-coder:7b-v8-review" in models
+
+
+def test_worker_card_is_keyed_by_coder_model(monkeypatch, tmp_path):
+    # Probes feed the worker card under the coder model, not
+    # under qwen3:4b: the card measures the model that ran.
+    _profile_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _fake_ok)
+    colony = spawn_colony_internal("standard")
+    run_probes(colony)
+    card = get_profile("worker", MODEL_TIERS["worker"])
+    assert card is not None
+    assert card["model"] == "qwen2.5-coder:7b-v8-review"
+    assert card["samples"] == 5
+    # No card exists for the worker under the old model.
+    assert get_profile("worker", "qwen3:4b") is None
+
+
 def test_run_probes_with_ok_fake(monkeypatch, tmp_path):
     _profile_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(probes_module, "sync_query_ollama", _fake_ok)
@@ -221,7 +269,7 @@ def test_run_probes_with_ok_fake(monkeypatch, tmp_path):
         assert result["failure_kind"] is None
         assert result["elapsed_seconds"] >= _MIN_ELAPSED
     for role in ("scout", "worker", "memory"):
-        card = get_profile(role, "qwen3:4b")
+        card = get_profile(role, MODEL_TIERS[role])
         assert card is not None, role
         assert card["samples"] == 5
         assert card["successes"] == 5
@@ -240,7 +288,7 @@ def test_run_probes_error_string_is_failure(monkeypatch, tmp_path):
     for result in results:
         assert result["status"] == "failed"
         assert result["failure_kind"] == "error"
-    card = get_profile("worker", "qwen3:4b")
+    card = get_profile("worker", MODEL_TIERS["worker"])
     assert card["failures"] == 5
     assert card["failure_modes"] == {"error": 5}
 
@@ -312,7 +360,7 @@ def test_spawn_probes_by_default(monkeypatch, tmp_path):
 
     asyncio.run(main())
     assert get_profile("scout", "qwen3:4b")["samples"] == 5
-    assert get_profile("worker", "qwen3:4b")["samples"] == 5
+    assert get_profile("worker", MODEL_TIERS["worker"])["samples"] == 5
 
 
 def test_spawn_returns_colony_when_probes_fail(monkeypatch, tmp_path):
@@ -327,7 +375,7 @@ def test_spawn_returns_colony_when_probes_fail(monkeypatch, tmp_path):
         await server.dissolve_colony(result["colony_id"])
 
     asyncio.run(main())
-    card = get_profile("worker", "qwen3:4b")
+    card = get_profile("worker", MODEL_TIERS["worker"])
     assert card["failures"] == 5
 
 
@@ -355,7 +403,7 @@ def test_real_swarm_run_feeds_card(monkeypatch, tmp_path):
         {"prompt": "list files in the folder"},
     ], colony)
     assert len(results) == 2
-    worker_card = get_profile("worker", "qwen3:4b")
+    worker_card = get_profile("worker", MODEL_TIERS["worker"])
     assert worker_card["per_task_type"]["write"]["samples"] == 1
     assert worker_card["per_task_type"]["write"]["successes"] == 1
     scout_card = get_profile("scout", "qwen3:4b")
@@ -366,7 +414,7 @@ def test_real_swarm_run_feeds_card(monkeypatch, tmp_path):
     # the card: the call worked, the answer did not.
     monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_uncertain)
     execute_parallel_swarm([{"prompt": "write a short note"}], colony)
-    worker_card = get_profile("worker", "qwen3:4b")
+    worker_card = get_profile("worker", MODEL_TIERS["worker"])
     assert worker_card["per_task_type"]["write"]["samples"] == 2
     assert worker_card["per_task_type"]["write"]["failures"] == 1
     assert worker_card["failure_modes"] == {"uncertain": 1}
@@ -788,8 +836,8 @@ def test_swarm_result_marks_profiled(monkeypatch, tmp_path):
     assert results[0]["profiled"] is False
     for task_type in PROBE_TASK_TYPES:
         for _ in range(MIN_SAMPLES_PER_TYPE):
-            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
-    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+            record_profile_run("worker", MODEL_TIERS["worker"], task_type, 0.1, True)
+    assert get_profile("worker", MODEL_TIERS["worker"])["trusted"] is True
     results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
     assert len(results) == 1
     assert results[0]["profiled"] is True
@@ -836,8 +884,8 @@ def test_swarm_failure_result_marks_profiled(monkeypatch, tmp_path):
     assert results[0]["profiled"] is False
     for task_type in PROBE_TASK_TYPES:
         for _ in range(MIN_SAMPLES_PER_TYPE):
-            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
-    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+            record_profile_run("worker", MODEL_TIERS["worker"], task_type, 0.1, True)
+    assert get_profile("worker", MODEL_TIERS["worker"])["trusted"] is True
     results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
     assert len(results) == 1
     assert results[0]["status"] == "failed"
@@ -887,11 +935,11 @@ def test_inconsistent_card_entry_not_profiled(monkeypatch, tmp_path):
     # card still says trusted, but the write entry does not.
     for task_type in PROBE_TASK_TYPES:
         for _ in range(MIN_SAMPLES_PER_TYPE):
-            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
-    assert get_profile("worker", "qwen3:4b")["trusted"] is True
-    card = get_profile("worker", "qwen3:4b")
+            record_profile_run("worker", MODEL_TIERS["worker"], task_type, 0.1, True)
+    assert get_profile("worker", MODEL_TIERS["worker"])["trusted"] is True
+    card = get_profile("worker", MODEL_TIERS["worker"])
     card["per_task_type"]["write"]["trusted"] = False
-    with open(_card_path("worker", "qwen3:4b"), "w", encoding="utf-8") as f:
+    with open(_card_path("worker", MODEL_TIERS["worker"]), "w", encoding="utf-8") as f:
         json.dump(card, f, indent=2, sort_keys=True)
     colony = spawn_colony_internal("standard")
     results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
@@ -916,9 +964,9 @@ def test_load_spread_swap_is_not_profiled(monkeypatch, tmp_path):
     workers[1].model = "qwen2.5:14b"
     for task_type in PROBE_TASK_TYPES:
         for _ in range(MIN_SAMPLES_PER_TYPE):
-            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
+            record_profile_run("worker", MODEL_TIERS["worker"], task_type, 0.1, True)
             record_profile_run("worker", "qwen2.5:14b", task_type, 0.5, True)
-    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+    assert get_profile("worker", MODEL_TIERS["worker"])["trusted"] is True
     assert get_profile("worker", "qwen2.5:14b")["trusted"] is True
     results = execute_parallel_swarm([
         {"prompt": "write a short note"},
@@ -942,7 +990,7 @@ def test_profiled_captured_at_assignment(monkeypatch, tmp_path):
         time.sleep(_FAKE_DELAY)
         for task_type in PROBE_TASK_TYPES:
             for _ in range(MIN_SAMPLES_PER_TYPE):
-                record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
+                record_profile_run("worker", MODEL_TIERS["worker"], task_type, 0.1, True)
         return "def add(a, b):\n    return a + b"
 
     monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_trusts_card)
@@ -952,7 +1000,7 @@ def test_profiled_captured_at_assignment(monkeypatch, tmp_path):
     results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
     assert len(results) == 1
     assert results[0]["profiled"] is False
-    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+    assert get_profile("worker", MODEL_TIERS["worker"])["trusted"] is True
     # The card is trusted now, so the next pick is profiled.
     monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
     results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)

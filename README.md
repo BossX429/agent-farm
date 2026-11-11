@@ -173,10 +173,10 @@ planner does not stall the async event loop.
 | Role | Model | VRAM | Purpose |
 |------|-------|------|---------|
 | Scout | qwen3:4b | 2.5GB | Reconnaissance |
-| Worker | qwen3:4b | 2.5GB | Task execution |
+| Worker | qwen2.5-coder:7b-v8-review | 8.1GB | Task execution (code-tuned) |
 | Memory | qwen3:4b | 2.5GB | Context retention |
 | Guardian | qwen3:4b | 2.5GB | System monitoring |
-| Learner | qwen3:4b | 2.5GB | Pattern acquisition |
+| Learner | qwen2.5-coder:7b-v8-review | 8.1GB | Pattern acquisition (code-tuned) |
 | **Synthesizer** | **qwen2.5:14b** | **8.99GB** | **Result synthesis** |
 
 Code review, code generation, and KMKB synthesis use the synthesizer tier,
@@ -264,7 +264,7 @@ The chunked write pattern solves the ~500 char output limitation of small models
    |-- Creates structured JSON outline
    |-- {"sections": [{"title": "...", "description": "..."}]}
 
-2. WORKER BUGS (qwen3:4b) - IN PARALLEL
+2. WORKER BUGS (qwen2.5-coder:7b-v8-review) - IN PARALLEL
    |-- Each writes one section (~300-500 chars)
    |-- 4 workers = 4 sections simultaneously
 
