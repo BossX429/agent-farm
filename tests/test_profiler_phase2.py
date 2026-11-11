@@ -773,3 +773,211 @@ def test_stale_lock_is_removed(monkeypatch, tmp_path):
     assert elapsed < 5.0
     assert not lock_path.exists()
     assert record_profile_run("worker", "qwen3:4b", "write", 1.0, True) is True
+
+
+def test_swarm_result_marks_profiled(monkeypatch, tmp_path):
+    # A swarm result says whether its pick was profile-driven.
+    # No trusted card yet: the pick is a fallback, marked False.
+    # With a trusted card: the same task is marked True.
+    _profile_dir(monkeypatch, tmp_path)
+    reset_metrics()
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
+    colony = spawn_colony_internal("standard")
+    results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
+    assert len(results) == 1
+    assert results[0]["profiled"] is False
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
+    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+    results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
+    assert len(results) == 1
+    assert results[0]["profiled"] is True
+    reset_metrics()
+
+
+def test_tool_swarm_result_marks_profiled(monkeypatch, tmp_path):
+    # A tool-swarm result carries the same marking.
+    import agent_farm.agent as agent_module
+    from agent_farm.agent import run_tool_swarm
+
+    _profile_dir(monkeypatch, tmp_path)
+
+    def _fake_agent(role, model, task, context="", deep=False):
+        return {
+            "answer": "done", "tool_calls": [],
+            "iterations": 1, "status": "completed", "mode": "test",
+        }
+
+    monkeypatch.setattr(agent_module, "run_tool_agent", _fake_agent)
+    colony = spawn_colony_internal("hybrid")
+    results = run_tool_swarm([{"prompt": "list files in the folder"}], colony.bugs)
+    assert len(results) == 1
+    assert results[0]["profiled"] is False
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("scout", "qwen3:4b", task_type, 0.1, True)
+    assert get_profile("scout", "qwen3:4b")["trusted"] is True
+    results = run_tool_swarm([{"prompt": "list files in the folder"}], colony.bugs)
+    assert len(results) == 1
+    assert results[0]["profiled"] is True
+
+
+def test_swarm_failure_result_marks_profiled(monkeypatch, tmp_path):
+    # A failed swarm result carries the marking too: the flag
+    # is about the routing decision, not the outcome.
+    _profile_dir(monkeypatch, tmp_path)
+    reset_metrics()
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_error)
+    colony = spawn_colony_internal("standard")
+    results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["profiled"] is False
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
+    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+    results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["profiled"] is True
+    reset_metrics()
+
+
+def test_tool_swarm_failure_result_marks_profiled(monkeypatch, tmp_path):
+    # A tool-swarm result from a raised exception carries it too.
+    import agent_farm.agent as agent_module
+    from agent_farm.agent import run_tool_swarm
+
+    _profile_dir(monkeypatch, tmp_path)
+
+    def _fake_raise(role, model, task, context="", deep=False):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(agent_module, "run_tool_agent", _fake_raise)
+    colony = spawn_colony_internal("hybrid")
+    results = run_tool_swarm([{"prompt": "list files in the folder"}], colony.bugs)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["profiled"] is False
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("scout", "qwen3:4b", task_type, 0.1, True)
+    assert get_profile("scout", "qwen3:4b")["trusted"] is True
+    results = run_tool_swarm([{"prompt": "list files in the folder"}], colony.bugs)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["profiled"] is True
+
+
+def test_inconsistent_card_entry_not_profiled(monkeypatch, tmp_path):
+    # A card that claims to be trusted overall but has an
+    # untrusted entry for the requested type is not evidence
+    # for that type. The entry check must be enforced, not
+    # just the card-level flag.
+    import json
+
+    from agent_farm.profiles import _card_path
+
+    _profile_dir(monkeypatch, tmp_path)
+    reset_metrics()
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
+    # Build a trusted worker card, then corrupt one entry: the
+    # card still says trusted, but the write entry does not.
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
+    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+    card = get_profile("worker", "qwen3:4b")
+    card["per_task_type"]["write"]["trusted"] = False
+    with open(_card_path("worker", "qwen3:4b"), "w", encoding="utf-8") as f:
+        json.dump(card, f, indent=2, sort_keys=True)
+    colony = spawn_colony_internal("standard")
+    results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
+    assert len(results) == 1
+    assert results[0]["profiled"] is False
+    reset_metrics()
+
+
+def test_load_spread_swap_is_not_profiled(monkeypatch, tmp_path):
+    # Two write tasks, both workers with trusted cards, the
+    # first worker faster. The first task takes the profile
+    # pick; the second wants the same bug, so load-spreading
+    # swaps it to the other worker. That second bug has a
+    # trusted card too, but it was not the profile pick, so
+    # its result is not profiled.
+    _profile_dir(monkeypatch, tmp_path)
+    reset_metrics()
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
+    colony = spawn_colony_internal("standard")
+    workers = [b for b in colony.bugs if b.role == "worker"]
+    assert len(workers) == 2
+    workers[1].model = "qwen2.5:14b"
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
+            record_profile_run("worker", "qwen2.5:14b", task_type, 0.5, True)
+    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+    assert get_profile("worker", "qwen2.5:14b")["trusted"] is True
+    results = execute_parallel_swarm([
+        {"prompt": "write a short note"},
+        {"prompt": "write another note"},
+    ], colony)
+    assert len(results) == 2
+    by_task = {r["task"]: r for r in results}
+    assert by_task["write a short note"]["profiled"] is True
+    assert by_task["write another note"]["profiled"] is False
+    reset_metrics()
+
+
+def test_profiled_captured_at_assignment(monkeypatch, tmp_path):
+    # The flag is fixed when the router picks, not when the
+    # result lands. A card that becomes trusted during the
+    # model call must not rewrite a fallback pick as profiled.
+    _profile_dir(monkeypatch, tmp_path)
+    reset_metrics()
+
+    def _fake_trusts_card(model, prompt, **kwargs):
+        time.sleep(_FAKE_DELAY)
+        for task_type in PROBE_TASK_TYPES:
+            for _ in range(MIN_SAMPLES_PER_TYPE):
+                record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
+        return "def add(a, b):\n    return a + b"
+
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_trusts_card)
+    colony = spawn_colony_internal("standard")
+    # No card at assignment time: fallback, even though the
+    # fake trusts the card before the call returns.
+    results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
+    assert len(results) == 1
+    assert results[0]["profiled"] is False
+    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+    # The card is trusted now, so the next pick is profiled.
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
+    results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
+    assert len(results) == 1
+    assert results[0]["profiled"] is True
+    reset_metrics()
+
+
+def test_direct_write_and_no_bug_results_have_profiled(monkeypatch, tmp_path):
+    # Every task result carries the flag, including the ones
+    # that never reach a bug: a direct write and a task with
+    # no bugs available. Neither was profile-driven.
+    import agent_farm.agent as agent_module
+    from agent_farm.agent import run_tool_swarm
+
+    _profile_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(agent_module, "execute_tool", lambda *a, **k: {})
+    results = run_tool_swarm(
+        [{"path": "note.txt", "content": "hello"}],
+        spawn_colony_internal("standard").bugs,
+    )
+    assert len(results) == 1
+    assert results[0]["direct_execute"] is True
+    assert results[0]["profiled"] is False
+    results = run_tool_swarm([{"prompt": "list files in the folder"}], [])
+    assert len(results) == 1
+    assert results[0]["bug_id"] is None
+    assert results[0]["profiled"] is False

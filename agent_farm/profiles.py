@@ -525,6 +525,23 @@ def task_type_for_prompt(prompt: str) -> str:
     return "general"
 
 
+def _card_usable_for(card: Dict[str, Any], task_type: str) -> bool:
+    """True when a card can drive a profile pick for a task type.
+
+    The card must be for this machine, trusted, not stale, and
+    its entry for the task type must be trusted too. The entry
+    check matters: a card that claims to be trusted overall but
+    has an untrusted entry for the requested type is not
+    evidence for that type.
+    """
+    if card.get("machine") != machine_slug():
+        return False
+    if not card.get("trusted") or card.get("stale"):
+        return False
+    entry = card.get("per_task_type", {}).get(task_type)
+    return bool(entry and entry.get("trusted"))
+
+
 def profile_pick(task_type: str, bugs: List[Any]) -> Optional[Any]:
     """Pick a bug from measured profile evidence, or None.
 
@@ -541,12 +558,10 @@ def profile_pick(task_type: str, bugs: List[Any]) -> Optional[Any]:
     best = None
     best_key = None
     for card in list_profiles():
-        if card.get("machine") != machine_slug():
-            continue
-        if not card.get("trusted") or card.get("stale"):
+        if not _card_usable_for(card, task_type):
             continue
         entry = card.get("per_task_type", {}).get(task_type)
-        if not entry or not entry.get("trusted"):
+        if entry is None:
             continue
         for bug in bugs:
             if bug.role == card["role"] and bug.model == card["model"]:
