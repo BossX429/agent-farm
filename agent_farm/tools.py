@@ -26,6 +26,7 @@ import ssl
 import http.client
 import ipaddress
 import subprocess
+import tempfile
 import httpx
 from urllib.parse import urlparse, urljoin
 from typing import Dict, List, Any, Callable, Optional
@@ -54,10 +55,41 @@ EXEC_TIMEOUT = 60      # 60 second max for commands
 BLOCKED_PATHS = ["/etc/shadow", "/etc/passwd", "/etc/gshadow", "/etc/sudoers",
                  "/root", "/boot", "/sys", "/proc/kcore"]
 
+def _is_dedicated_temp_dir(path: str) -> bool:
+    """True iff `path` is a real, dedicated temp dir.
+
+    Guards the allowlist against a TEMP/TMPDIR that points somewhere
+    broad: adding a home dir or a drive root would make the whole home
+    folder or drive writable, which is not a temp dir. Only a directory
+    that exists, is not the user's home, and is not a filesystem root
+    counts.
+    """
+    try:
+        real = os.path.realpath(path)
+    except Exception:
+        return False
+    if not os.path.isdir(real):
+        return False
+    if real == os.path.realpath(os.path.expanduser("~")):
+        return False
+    # Filesystem root: "/" on POSIX; "C:\" (or any drive root) on Windows.
+    drive, _ = os.path.splitdrive(real)
+    if real == drive + os.sep or real == os.sep:
+        return False
+    return True
+
+
 # Directories writes are allowed in (see tool_write_file). Matched with
 # commonpath() against the canonical path, so "/tmpfoo" does NOT pass as
 # "/tmp", and a symlink inside /tmp pointing elsewhere does not pass either.
+# The system temp dir is included on every platform: on Linux it is /tmp
+# already, and on Windows it is the user's Temp folder, where pytest's
+# tmp_path lives. The list stays a real boundary: only the temp dir, the
+# repos folder, and the Desktop -- never the whole drive or home.
 ALLOWED_WRITE_DIRS = ["/tmp", "/home/kyle/repos", "/home/kyle/Desktop"]
+if _is_dedicated_temp_dir(tempfile.gettempdir()):
+    if tempfile.gettempdir() not in ALLOWED_WRITE_DIRS:
+        ALLOWED_WRITE_DIRS.append(tempfile.gettempdir())
 
 # SECURITY NOTE -- READ BEFORE RELAXING THIS LIST:
 # exec_cmd() never runs a shell. Simple commands run shell=False, and

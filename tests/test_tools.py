@@ -8,11 +8,19 @@ tmp_path.
 
 import os
 import socket
+import sys
+import tempfile
 
 import pytest
 
 from agent_farm import tools
 from agent_farm.server import _unique_id
+
+# The running Python, quoted and with forward slashes: tool_exec_cmd
+# parses commands with shlex (POSIX mode), which would eat the
+# backslashes in a Windows path, and an unquoted path with spaces
+# would split into fragments. Forward slashes work for CreateProcess.
+PY = '"' + sys.executable.replace("\\", "/") + '"'
 
 
 # ---------- path safety ----------
@@ -32,18 +40,26 @@ def test_write_allowlist_prefix_lookalike(tmp_path):
 
 
 def test_write_allowlist_and_symlink(tmp_path):
-    # A symlink inside /tmp pointing outside the allowlist must not pass.
-    # The target must itself be outside /tmp and outside the other
-    # allowed dirs, otherwise the canonical path is legitimately allowed.
+    # A symlink inside an allowed dir pointing outside it must not pass.
+    # The link lives under tmp_path (an allowed dir), so the test checks
+    # the symlink escape itself -- the old version put the link under
+    # "/tmp", which on Windows is C:\tmp, not an allowed dir at all,
+    # so it passed for the wrong reason. Skip when the platform does
+    # not permit creating symlinks. The target must itself be outside
+    # every allowed dir, otherwise the canonical path is legitimately
+    # allowed.
     outside = os.path.expanduser("~/af_outside_test_xyz.txt")
     with open(outside, "w") as f:
         f.write("secret")
-    link = os.path.join("/tmp", "af_test_link_xyz")
+    link = tmp_path / "af_test_link_xyz"
     try:
         if os.path.lexists(link):
             os.unlink(link)
-        os.symlink(outside, link)
-        assert not tools.is_write_path_allowed(link)
+        try:
+            os.symlink(outside, link)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not permitted on this platform")
+        assert not tools.is_write_path_allowed(str(link))
     finally:
         if os.path.lexists(link):
             os.unlink(link)
@@ -74,9 +90,33 @@ def test_command_blocklist_variants():
 
 
 def test_exec_simple_runs_without_shell():
-    result = tools.tool_exec_cmd("echo hello")
+    result = tools.tool_exec_cmd(f"{PY} -c \"print('hello')\"")
     assert result["returncode"] == 0
     assert result["stdout"].strip() == "hello"
+
+
+def test_write_path_allowed_in_system_temp_dir(tmp_path):
+    # The system temp dir is in the write allowlist on every
+    # platform. Only require tmp_path to be writable when it actually
+    # lives inside an allowed root: with --basetemp set outside the
+    # allowlist, the allowlist correctly rejects it and the test must
+    # not fail for that.
+    assert tools.is_write_path_allowed(
+        os.path.join(tempfile.gettempdir(), "x.txt")
+    )
+    if tools.is_write_path_allowed(str(tmp_path)):
+        assert tools.is_write_path_allowed(str(tmp_path / "x.txt"))
+
+
+def test_dedicated_temp_dir_validation():
+    # The temp-dir guard: a real temp dir passes, but a home dir, a
+    # filesystem root, or a missing dir must never be added to the
+    # write allowlist, or the whole home folder or drive becomes
+    # writable.
+    assert tools._is_dedicated_temp_dir(tempfile.gettempdir())
+    assert not tools._is_dedicated_temp_dir(os.path.expanduser("~"))
+    assert not tools._is_dedicated_temp_dir(os.path.abspath(os.sep))
+    assert not tools._is_dedicated_temp_dir("/nonexistent-xyz-12345")
 
 
 def test_exec_blocked_does_not_run(tmp_path):

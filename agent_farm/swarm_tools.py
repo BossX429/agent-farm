@@ -313,7 +313,8 @@ async def file_swarm(operations: str) -> dict:
         # own blocked-directory list and allowed write/append/delete
         # anywhere outside it, including the whole home directory
         # (credentials, SSH files, Documents, etc.), while write_file
-        # only allows /tmp, /home/kyle/repos, and /home/kyle/Desktop.
+        # only allows /tmp, /home/kyle/repos, /home/kyle/Desktop, and
+        # the platform temp dir (see ALLOWED_WRITE_DIRS in tools.py).
         # Now: reads/exists use the shared swarm-read check (blocked
         # system dirs + sensitive files, canonical/symlink-resolved),
         # and writes/appends/deletes use the shared write allowlist.
@@ -322,6 +323,7 @@ async def file_swarm(operations: str) -> dict:
         # sandbox -- see the exec_cmd note in tools.py. Run locally
         # with trusted prompts only.
         from .tools import (
+            ALLOWED_WRITE_DIRS,
             tool_read_file,
             tool_write_file,
             tool_file_exists,
@@ -339,7 +341,7 @@ async def file_swarm(operations: str) -> dict:
             if raw_path and not is_write_path_allowed(raw_path):
                 log_action("file_blocked", "blocked", f"file_swarm blocked {action}: {raw_path}")
                 return {"action": action, "path": raw_path,
-                        "error": "Write only allowed in: /tmp, /home/kyle/repos, /home/kyle/Desktop"}
+                        "error": f"Write only allowed in: {ALLOWED_WRITE_DIRS}"}
 
         try:
             if action == "read":
