@@ -745,3 +745,31 @@ def test_concurrent_processes_do_not_lose_runs(monkeypatch, tmp_path):
         assert proc.wait(timeout=60) == 0
     card = get_profile("worker", "qwen3:4b")
     assert card["samples"] == 6
+
+
+def test_stale_lock_is_removed(monkeypatch, tmp_path):
+    """A lock left by a dead process is removed, not waited out.
+
+    The stale check compares the lock file's mtime (wall clock)
+    against time.time(). Using the monotonic clock there made the
+    check never fire: monotonic is seconds since boot, mtime is
+    seconds since 1970, so their difference is always a large
+    negative number and no lock ever looked stale.
+    """
+    import os
+
+    from agent_farm.profiles import _card_lock, _card_path
+
+    monkeypatch.setenv("AGENT_FARM_PROFILES_DIR", str(tmp_path))
+    path = _card_path("worker", "qwen3:4b")
+    lock_path = path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("", encoding="utf-8")
+    old = time.time() - 40.0
+    os.utime(lock_path, (old, old))
+    started = time.monotonic()
+    with _card_lock(path):
+        elapsed = time.monotonic() - started
+    assert elapsed < 5.0
+    assert not lock_path.exists()
+    assert record_profile_run("worker", "qwen3:4b", "write", 1.0, True) is True

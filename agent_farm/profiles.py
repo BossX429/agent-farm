@@ -336,7 +336,10 @@ def _card_lock(path: Path):
                 break
             except FileExistsError:
                 try:
-                    if time.monotonic() - os.path.getmtime(lock_path) > 30.0:
+                    # getmtime is wall-clock time, so the age
+                    # check must use time.time(), not the
+                    # monotonic clock used for the deadline.
+                    if time.time() - os.path.getmtime(lock_path) > 30.0:
                         os.unlink(lock_path)
                         continue
                 except OSError:
