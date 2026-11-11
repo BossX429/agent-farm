@@ -847,3 +847,51 @@ def test_tool_swarm_result_marks_profiled(monkeypatch, tmp_path):
     results = run_tool_swarm([{"prompt": "list files in the folder"}], colony.bugs)
     assert len(results) == 1
     assert results[0]["profiled"] is True
+
+
+def test_swarm_failure_result_marks_profiled(monkeypatch, tmp_path):
+    # A failed swarm result carries the marking too: the flag
+    # is about the routing decision, not the outcome.
+    _profile_dir(monkeypatch, tmp_path)
+    reset_metrics()
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_error)
+    colony = spawn_colony_internal("standard")
+    results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["profiled"] is False
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("worker", "qwen3:4b", task_type, 0.1, True)
+    assert get_profile("worker", "qwen3:4b")["trusted"] is True
+    results = execute_parallel_swarm([{"prompt": "write a short note"}], colony)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["profiled"] is True
+    reset_metrics()
+
+
+def test_tool_swarm_failure_result_marks_profiled(monkeypatch, tmp_path):
+    # A tool-swarm result from a raised exception carries it too.
+    import agent_farm.agent as agent_module
+    from agent_farm.agent import run_tool_swarm
+
+    _profile_dir(monkeypatch, tmp_path)
+
+    def _fake_raise(role, model, task, context="", deep=False):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(agent_module, "run_tool_agent", _fake_raise)
+    colony = spawn_colony_internal("hybrid")
+    results = run_tool_swarm([{"prompt": "list files in the folder"}], colony.bugs)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["profiled"] is False
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            record_profile_run("scout", "qwen3:4b", task_type, 0.1, True)
+    assert get_profile("scout", "qwen3:4b")["trusted"] is True
+    results = run_tool_swarm([{"prompt": "list files in the folder"}], colony.bugs)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["profiled"] is True
