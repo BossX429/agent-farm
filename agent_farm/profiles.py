@@ -529,9 +529,10 @@ def _card_usable_for(card: Dict[str, Any], task_type: str) -> bool:
     """True when a card can drive a profile pick for a task type.
 
     The card must be for this machine, trusted, not stale, and
-    its entry for the task type must be trusted too. One helper
-    so profile_pick and pick_is_profiled agree on what counts
-    as evidence; they must never drift apart.
+    its entry for the task type must be trusted too. The entry
+    check matters: a card that claims to be trusted overall but
+    has an untrusted entry for the requested type is not
+    evidence for that type.
     """
     if card.get("machine") != machine_slug():
         return False
@@ -569,27 +570,6 @@ def profile_pick(task_type: str, bugs: List[Any]) -> Optional[Any]:
                     best_key = key
                     best = bug
     return best
-
-
-def pick_is_profiled(task_type: str, bug: Any) -> bool:
-    """True when one bug's pick for a task type is profile-driven.
-
-    The bug's role + model must have a trusted, non-stale card
-    for this machine whose entry for the task type is trusted.
-    This is the same test profile_pick applies, for one bug: it
-    marks whether the bug that ran a task was chosen on evidence
-    or fell back to keyword routing. A swarm result carries this
-    as "profiled" so the gap is visible, not hidden. Never
-    raises: a missing card or a bad bug is unprofiled, not an
-    error.
-    """
-    try:
-        card = get_profile(bug.role, bug.model)
-    except Exception:
-        return False
-    if card is None:
-        return False
-    return _card_usable_for(card, task_type)
 
 
 def record_profile_run(

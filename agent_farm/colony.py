@@ -24,7 +24,6 @@ from .metrics import record_bug_run
 from .profiles import (
     TASK_TYPE_ROLES,
     classify_result,
-    pick_is_profiled,
     profile_pick,
     record_profile_run,
     task_type_for_prompt,
@@ -121,10 +120,21 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
     if not tasks or not colony.bugs:
         return results
     
-    # Smart routing - match tasks to appropriate bugs
+    # Smart routing - match tasks to appropriate bugs.
+    # Whether a pick was profile-driven is captured HERE, at
+    # assignment time, and carried into the result. It is the
+    # router's decision, so it must be read when the router
+    # decides: re-reading the card after the run would let a
+    # card change mid-call rewrite a fallback as profiled.
+    # The pick counts as profiled only when the bug that
+    # finally runs the task IS the one the profile picked. A
+    # load-spread swap to another bug, even one with its own
+    # trusted card, is a fallback, not evidence.
     bug_assignments = []
     used_bugs = set()
     for task in tasks:
+        task_type = task_type_for_prompt(task.get("prompt", ""))
+        profiled_bug = profile_pick(task_type, colony.bugs)
         bug = get_best_bug_for_task(task, colony)
         # Try to spread load if same bug keeps getting picked
         if bug.id in used_bugs and len(colony.bugs) > 1:
@@ -135,20 +145,21 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                 same_role = [b for b in alternatives if b.role == bug.role]
                 bug = same_role[0] if same_role else alternatives[0]
         used_bugs.add(bug.id)
-        bug_assignments.append((bug, task))
+        profiled = profiled_bug is not None and bug.id == profiled_bug.id
+        bug_assignments.append((bug, task, profiled))
     
     # Execute in parallel (workers capped, never zero -- see guard above)
     with ThreadPoolExecutor(max_workers=max(1, min(len(colony.bugs), 8))) as executor:
         futures = {}
-        for bug, task in bug_assignments:
+        for bug, task, profiled in bug_assignments:
             prompt = task.get("prompt", "")
             context = task.get("context", "")
             full_prompt = f"Context: {context}\n\nTask: {prompt}" if context else prompt
             future = executor.submit(_run_bug_query, bug, full_prompt)
-            futures[future] = (bug, task, time.monotonic())
+            futures[future] = (bug, task, profiled, time.monotonic())
 
         for future in as_completed(futures):
-            bug, task, submitted = futures[future]
+            bug, task, profiled, submitted = futures[future]
             response = None
             error = None
             try:
@@ -175,14 +186,12 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
                 # reliability._is_failed_fragment.
                 error = response
                 response = None
-            # Phase 3: mark whether this pick was profile-driven.
-            # The bug that ran the task either has a trusted card
-            # for this task type (evidence) or it does not (the
-            # router fell back to keyword routing). The flag is
-            # about the routing decision, not the outcome, so it
-            # goes on success and failure results alike.
+            # The "profiled" flag was captured at assignment time
+            # and carried here; it is about the routing decision,
+            # not the outcome, so it goes on success and failure
+            # results alike. task_type is still needed below to
+            # record this run on the bug's card.
             task_type = task_type_for_prompt(task.get("prompt", ""))
-            profiled = pick_is_profiled(task_type, bug)
             if error is None:
                 result = {
                     "bug_id": bug.id,

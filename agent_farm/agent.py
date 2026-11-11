@@ -20,7 +20,6 @@ from .tools import (
 from .profiles import (
     TASK_TYPE_ROLES,
     classify_result,
-    pick_is_profiled,
     profile_pick,
     record_profile_run,
     task_type_for_prompt,
@@ -752,6 +751,9 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
             "status": "completed" if "error" not in result else "failed",
             "mode": "direct",
             "direct_execute": True,
+            # No bug ran this task and no profile was consulted,
+            # so the pick was not profile-driven.
+            "profiled": False,
         })
 
     if not bug_tasks:
@@ -769,13 +771,26 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                 "task": task.get("prompt", "")[:50] if isinstance(task, dict) else "",
                 "error": "No bugs available to run this task",
                 "status": "failed",
+                # No bug existed to pick, so nothing was profiled.
+                "profiled": False,
             })
         return results
 
-    # Smart routing - match tasks to appropriate bugs
+    # Smart routing - match tasks to appropriate bugs.
+    # Whether a pick was profile-driven is captured HERE, at
+    # assignment time, and carried into the result. It is the
+    # router's decision, so it must be read when the router
+    # decides: re-reading the card after the run would let a
+    # card change mid-call rewrite a fallback as profiled.
+    # The pick counts as profiled only when the bug that
+    # finally runs the task IS the one the profile picked. A
+    # load-spread swap to another bug, even one with its own
+    # trusted card, is a fallback, not evidence.
     bug_assignments = []
     used_bugs = set()
     for task in bug_tasks:
+        task_type = task_type_for_prompt(task.get("prompt", ""))
+        profiled_bug = profile_pick(task_type, bugs)
         bug = get_best_bug_for_task(task, bugs)
         if bug.id in used_bugs and len(bugs) > 1:
             alternatives = [b for b in bugs if b.id not in used_bugs]
@@ -783,7 +798,8 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                 same_role = [b for b in alternatives if b.role == bug.role]
                 bug = same_role[0] if same_role else alternatives[0]
         used_bugs.add(bug.id)
-        bug_assignments.append((bug, task))
+        profiled = profiled_bug is not None and bug.id == profiled_bug.id
+        bug_assignments.append((bug, task, profiled))
     
     with ThreadPoolExecutor(max_workers=max(1, min(len(bugs), 8))) as executor:
         futures = {
@@ -793,12 +809,12 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                 task.get("prompt", ""),
                 task.get("context", ""),
                 deep=deep
-            ): (bug, task, time.monotonic())
-            for bug, task in bug_assignments
+            ): (bug, task, profiled, time.monotonic())
+            for bug, task, profiled in bug_assignments
         }
 
         for future in as_completed(futures):
-            bug, task, started = futures[future]
+            bug, task, profiled, started = futures[future]
             # Profiler factory: tool-swarm work is real work, so it
             # feeds the bug's profile card too. The elapsed time
             # covers the whole agent run (model calls plus tool
@@ -812,14 +828,11 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                 if result["status"] != "completed":
                     card_success = False
                     failure_kind = failure_kind or "error"
-                # Phase 3: mark whether this pick was profile-driven.
-                # True means the bug that ran the task has a trusted
-                # card for this task type; False means the router
-                # fell back to keyword routing and the pick was a
-                # guess. The flag is about the routing decision,
-                # not the outcome.
+                # The "profiled" flag was captured at assignment
+                # time and carried here; it is about the routing
+                # decision, not the outcome. task_type is still
+                # needed below to record this run on the card.
                 task_type = task_type_for_prompt(task.get("prompt", ""))
-                profiled = pick_is_profiled(task_type, bug)
                 saved = record_profile_run(
                     bug.role,
                     bug.model,
@@ -845,7 +858,6 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
             except Exception as e:
                 elapsed = time.monotonic() - started
                 task_type = task_type_for_prompt(task.get("prompt", ""))
-                profiled = pick_is_profiled(task_type, bug)
                 saved = record_profile_run(
                     bug.role,
                     bug.model,
