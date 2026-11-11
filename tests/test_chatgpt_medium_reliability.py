@@ -14,10 +14,16 @@ All tests run offline: model calls are mocked, no Ollama, no network.
 
 import asyncio
 import json
+import sys
 import threading
 import time
 
 import pytest
+
+# The running Python, with forward slashes: tool_exec_cmd parses
+# commands with shlex (POSIX mode), which would eat the backslashes
+# in a Windows path. Forward slashes work for CreateProcess too.
+PY = sys.executable.replace("\\", "/")
 
 from agent_farm import reliability
 from agent_farm.reliability import (
@@ -72,7 +78,7 @@ def test_api_swarm_and_file_swarm_reject_empty():
 
 
 def test_exec_swarm_still_runs_and_reports_truncation_flag():
-    result = run(exec_swarm(json.dumps(["echo hello"])))
+    result = run(exec_swarm(json.dumps([f"{PY} -c \"print('hello')\""])))
     assert result["results"][0]["status"] == "success"
     assert result["results"][0]["stdout"].strip() == "hello"
     assert "output_truncated" in result

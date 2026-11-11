@@ -322,6 +322,7 @@ async def file_swarm(operations: str) -> dict:
         # sandbox -- see the exec_cmd note in tools.py. Run locally
         # with trusted prompts only.
         from .tools import (
+            ALLOWED_WRITE_DIRS,
             tool_read_file,
             tool_write_file,
             tool_file_exists,
@@ -339,7 +340,7 @@ async def file_swarm(operations: str) -> dict:
             if raw_path and not is_write_path_allowed(raw_path):
                 log_action("file_blocked", "blocked", f"file_swarm blocked {action}: {raw_path}")
                 return {"action": action, "path": raw_path,
-                        "error": "Write only allowed in: /tmp, /home/kyle/repos, /home/kyle/Desktop"}
+                        "error": f"Write only allowed in: {ALLOWED_WRITE_DIRS}"}
 
         try:
             if action == "read":

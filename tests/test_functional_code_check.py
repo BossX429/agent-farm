@@ -131,7 +131,11 @@ def test_write_file_uses_utf8(tmp_path):
     result = tool_write_file(str(out), content)
     assert result.get("status") == "success"
     raw = out.read_bytes()
-    assert raw.decode("utf-8") == content
+    # Decode as UTF-8 (a cp1252 write would fail here: 0x92 / 0x97
+    # are not valid UTF-8), then normalise newlines: Windows text
+    # mode translates "\n" to "\r\n" on write, which is fine -- the
+    # encoding is what this test is about, not the line endings.
+    assert raw.decode("utf-8").replace("\r\n", "\n") == content
     # And reading it back through the tool returns the same text.
     read_back = tool_read_file(str(out))
     assert read_back.get("content") == content

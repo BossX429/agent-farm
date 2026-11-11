@@ -8,11 +8,20 @@ tmp_path.
 
 import os
 import socket
+import sys
+import tempfile
 
 import pytest
 
 from agent_farm import tools
 from agent_farm.server import _unique_id
+
+# The running Python, with forward slashes: tool_exec_cmd parses
+# commands with shlex (POSIX mode), which would eat the backslashes
+# in a Windows path. Forward slashes work for CreateProcess too.
+# Using the running interpreter -- not a bare "python" from PATH --
+# keeps the tests working wherever the suite runs.
+PY = sys.executable.replace("\\", "/")
 
 
 # ---------- path safety ----------
@@ -74,9 +83,18 @@ def test_command_blocklist_variants():
 
 
 def test_exec_simple_runs_without_shell():
-    result = tools.tool_exec_cmd("echo hello")
+    result = tools.tool_exec_cmd(f"{PY} -c \"print('hello')\"")
     assert result["returncode"] == 0
     assert result["stdout"].strip() == "hello"
+
+
+def test_write_path_allowed_in_system_temp_dir(tmp_path):
+    # The system temp dir is in the write allowlist on every
+    # platform, so tests (and real work) can write to tmp_path.
+    assert tools.is_write_path_allowed(str(tmp_path / "x.txt"))
+    assert tools.is_write_path_allowed(
+        os.path.join(tempfile.gettempdir(), "x.txt")
+    )
 
 
 def test_exec_blocked_does_not_run(tmp_path):

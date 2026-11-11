@@ -7,8 +7,14 @@ These tests fail if that bypass comes back.
 
 import asyncio
 import json
+import sys
 
 from agent_farm.server import exec_swarm, api_swarm
+
+# The running Python, with forward slashes: tool_exec_cmd parses
+# commands with shlex (POSIX mode), which would eat the backslashes
+# in a Windows path. Forward slashes work for CreateProcess too.
+PY = sys.executable.replace("\\", "/")
 
 
 def run(coro):
@@ -16,7 +22,7 @@ def run(coro):
 
 
 def test_exec_swarm_simple_command():
-    result = run(exec_swarm(json.dumps(["echo hello"])))
+    result = run(exec_swarm(json.dumps([f"{PY} -c \"print('hello')\""])))
     assert result["results"][0]["status"] == "success"
     assert result["results"][0]["stdout"].strip() == "hello"
 
