@@ -43,12 +43,16 @@ def test_server_exposes_25_tools():
 
 
 def test_colony_tools_work_without_ollama():
-    # These tools do not call Ollama, so they must work offline.
+    # Spawn probes by default (profiler factory Phase 2), so the
+    # offline path is the explicit opt-out: run_probes=False.
+    # These tools do not call Ollama with probes off, so they
+    # must work offline.
     import asyncio
 
     async def main():
-        colony = await server.spawn_colony("fast")
+        colony = await server.spawn_colony("fast", run_probes=False)
         assert colony["bugs"]
+        assert colony["probes"] is None
         status = await server.colony_status(colony["colony_id"])
         assert status["colony_id"] == colony["colony_id"]
         stats = await server.farm_stats()
