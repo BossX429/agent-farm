@@ -205,6 +205,49 @@ def test_record_never_raises_on_bad_input():
     assert record_colony_run("fast", "not-a-type", 1.0, True) is True
 
 
+def test_probes_feed_colony_card(monkeypatch):
+    # Probes are the primary way a new colony type earns trust
+    # quickly (5 tasks per spawn), so they must feed the colony
+    # card, not just the bug cards. The live proof on the PC
+    # caught this: after two heavy spawns with probes, the heavy
+    # card did not exist, because run_probes bypasses
+    # execute_parallel_swarm.
+    import agent_farm.probes as probes_module
+    from agent_farm.probes import PROBE_JOBS, run_probes
+
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _fake_ok)
+    colony = spawn_colony_internal("heavy")
+    results = run_probes(colony)
+    assert len(results) == len(PROBE_JOBS) * 3  # 3 role+model combos
+    for result in results:
+        assert result["colony_profile_saved"] is True
+    card = get_colony_profile("heavy")
+    assert card is not None
+    # 3 representative bugs x 5 probe jobs = 15 samples, 3 per type.
+    assert card["samples"] == 15
+    for task_type in PROBE_TASK_TYPES:
+        assert card["per_task_type"][task_type]["samples"] == 3
+    assert card["trusted"] is False
+
+
+def test_probes_trust_colony_card_after_five_spawns(monkeypatch):
+    # Five spawns with probes build a trusted colony card: 5
+    # samples per probe task type.
+    import agent_farm.probes as probes_module
+    from agent_farm.probes import run_probes
+
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _fake_ok)
+    for _ in range(5):
+        colony = spawn_colony_internal("heavy")
+        run_probes(colony)
+    card = get_colony_profile("heavy")
+    assert card is not None
+    assert card["samples"] == 75
+    for task_type in PROBE_TASK_TYPES:
+        assert card["per_task_type"][task_type]["samples"] == 15
+    assert card["trusted"] is True
+
+
 def test_swarm_run_feeds_colony_card(monkeypatch):
     monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
     colony = spawn_colony_internal("fast")

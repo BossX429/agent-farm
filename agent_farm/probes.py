@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
 
 from .ollama import sync_query_ollama
+from .colony_profiles import record_colony_run
 from .profiles import classify_result, record_profile_run
 from .reliability import MAX_MODEL_CONCURRENCY, MODEL_SEMAPHORE
 from .state import Colony
@@ -171,6 +172,18 @@ def run_probes(colony: Colony) -> List[Dict[str, Any]]:
                 success,
                 failure_kind,
             )
+            # Colony-type measurement: the same probe run feeds
+            # the colony type's card, so a new colony type earns
+            # trust from its probes instead of waiting for real
+            # task runs. record_colony_run never raises, so
+            # profiling cannot break the probe run.
+            colony_saved = record_colony_run(
+                colony.colony_type,
+                job["task_type"],
+                elapsed,
+                success,
+                failure_kind,
+            )
             results.append({
                 "bug_id": bug.id,
                 "role": bug.role,
@@ -181,6 +194,7 @@ def run_probes(colony: Colony) -> List[Dict[str, Any]]:
                 "elapsed_seconds": round(elapsed, 2),
                 "started_monotonic": started,
                 "profile_saved": saved,
+                "colony_profile_saved": colony_saved,
             })
     except TimeoutError:
         # Budget spent: jobs still running are reported as
