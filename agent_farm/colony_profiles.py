@@ -58,9 +58,15 @@ def colony_profiles_dir() -> Path:
 
 
 def _colony_card_path(colony_type: str) -> Path:
-    """Card file for a colony type on this machine."""
+    """Card file for a colony type on this machine.
+
+    The slug is capped at 64 characters so an overlong explicit
+    type cannot produce a filename past the filesystem's
+    component-length limit.
+    """
     safe = "".join(ch if ch.isalnum() else "-" for ch in colony_type.lower())
     safe = "-".join(part for part in safe.split("-") if part) or "unknown"
+    safe = safe[:64]
     return colony_profiles_dir() / f"colony-{safe}-{machine_slug()}.json"
 
 
@@ -160,6 +166,13 @@ def _normalize_colony_card(card: Any, colony_type: str) -> Optional[Dict[str, An
     if not isinstance(per_type, dict):
         per_type = {}
         card["per_task_type"] = per_type
+    # Drop any entry for a task type that does not exist: a
+    # malformed extra entry would otherwise reach
+    # _refresh_colony_card, which reads entry["samples"] on every
+    # entry and raises KeyError instead of recording.
+    for key in list(per_type):
+        if key not in TASK_TYPES:
+            del per_type[key]
     for task_type in TASK_TYPES:
         entry = per_type.get(task_type)
         if not isinstance(entry, dict):
@@ -199,23 +212,36 @@ def _load_colony_card(colony_type: str) -> Dict[str, Any]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 card = json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return create_colony_profile(colony_type)
         normalized = _normalize_colony_card(card, colony_type)
         return normalized if normalized is not None else create_colony_profile(colony_type)
     return create_colony_profile(colony_type)
 
 
+class _ColonyLockUnavailable(Exception):
+    """Raised when a card lock cannot be acquired in time."""
+
+
 @contextlib.contextmanager
 def _colony_card_lock(path: Path):
-    """Best-effort cross-process lock for one card's read-modify-write.
+    """Cross-process lock for one card's read-modify-write.
 
-    Same contract as profiles._card_lock: a lock file created
-    with O_EXCL, a lock older than 30 seconds is treated as
-    stale and removed, and if the lock cannot be taken within
-    10 seconds the update still runs rather than breaking the
-    swarm.
+    A lock file created with O_EXCL; a lock older than 30
+    seconds is treated as stale (its process died) and removed.
+    The directory is created first, so two processes recording
+    the same type before colony_profiles/ exists do not race
+    past each other without a lock. Unlike profiles._card_lock,
+    this NEVER yields without owning the lock: if the lock cannot
+    be taken within 10 seconds, it raises _ColonyLockUnavailable
+    and the caller skips the update (returns False) instead of
+    letting two recorders read the same card and overwrite one
+    another's samples.
     """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise _ColonyLockUnavailable(str(path))
     lock_path = path.with_suffix(".lock")
     fd = None
     try:
@@ -237,6 +263,8 @@ def _colony_card_lock(path: Path):
                 time.sleep(0.1)
             except OSError:
                 break
+        if fd is None:
+            raise _ColonyLockUnavailable(str(lock_path))
         yield
     finally:
         if fd is not None:
@@ -299,7 +327,7 @@ def list_colony_profiles() -> List[Dict[str, Any]]:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     card = json.load(f)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
             if not isinstance(card, dict):
                 continue
@@ -344,33 +372,36 @@ def record_colony_run(
     its own profiling.
     """
     try:
-        if not colony_type:
+        if not colony_type or colony_type not in COLONY_TYPES:
             return False
         elapsed = float(elapsed_seconds or 0.0)
     except (TypeError, ValueError):
         return False
     if task_type not in TASK_TYPES:
         task_type = "general"
-    with _LOCK, _colony_card_lock(_colony_card_path(colony_type)):
-        card = _load_colony_card(colony_type)
-        card["samples"] += 1
-        if success:
-            card["successes"] += 1
-        else:
-            card["failures"] += 1
-            if failure_kind:
-                modes = card["failure_modes"]
-                modes[failure_kind] = modes.get(failure_kind, 0) + 1
-        card["total_seconds"] += max(0.0, elapsed)
-        entry = card["per_task_type"][task_type]
-        entry["samples"] += 1
-        if success:
-            entry["successes"] += 1
-        else:
-            entry["failures"] += 1
-        entry["total_seconds"] += max(0.0, elapsed)
-        _refresh_colony_card(card)
-        return _save_colony_card(card)
+    try:
+        with _LOCK, _colony_card_lock(_colony_card_path(colony_type)):
+            card = _load_colony_card(colony_type)
+            card["samples"] += 1
+            if success:
+                card["successes"] += 1
+            else:
+                card["failures"] += 1
+                if failure_kind:
+                    modes = card["failure_modes"]
+                    modes[failure_kind] = modes.get(failure_kind, 0) + 1
+            card["total_seconds"] += max(0.0, elapsed)
+            entry = card["per_task_type"][task_type]
+            entry["samples"] += 1
+            if success:
+                entry["successes"] += 1
+            else:
+                entry["failures"] += 1
+            entry["total_seconds"] += max(0.0, elapsed)
+            _refresh_colony_card(card)
+            return _save_colony_card(card)
+    except (_ColonyLockUnavailable, OSError, ValueError, TypeError):
+        return False
 
 
 def _colony_card_usable_for(card: Dict[str, Any], task_type: str) -> bool:
@@ -395,12 +426,24 @@ def colony_type_pick(task_type: str) -> Optional[str]:
     best = None
     best_key = None
     for card in list_colony_profiles():
+        if card.get("colony_type") not in COLONY_TYPES:
+            continue
         if not _colony_card_usable_for(card, task_type):
             continue
         entry = card.get("per_task_type", {}).get(task_type)
         if entry is None:
             continue
-        key = (entry["success_rate"], -entry["avg_seconds"])
+        # Compare UNROUNDED ratios from the raw counts, not the
+        # rounded stored values: two cards whose success rates
+        # round to the same number (0.834 vs 0.836 -> 0.83) must
+        # not tie and fall back to sorted card order.
+        samples = entry["samples"]
+        if not samples:
+            continue
+        key = (
+            entry["successes"] / samples,
+            -(entry["total_seconds"] / samples),
+        )
         if best_key is None or key > best_key:
             best_key = key
             best = card["colony_type"]
@@ -416,7 +459,11 @@ def dominant_task_type(tasks: List[Dict[str, str]]) -> str:
     from .profiles import task_type_for_prompt
 
     counts: Dict[str, int] = {}
-    for task in tasks or []:
+    if not isinstance(tasks, list):
+        return "general"
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
         task_type = task_type_for_prompt(task.get("prompt", ""))
         counts[task_type] = counts.get(task_type, 0) + 1
     if not counts:
@@ -433,6 +480,11 @@ def resolve_colony_type(requested: str, tasks: List[Dict[str, str]], default: st
     is used as-is. Returns (colony_type, was_profile_picked).
     """
     if requested != "auto":
+        # An explicit type that is not built is not used: fall
+        # back to the default instead of spawning a colony whose
+        # reported type was never built.
+        if requested not in COLONY_TYPES:
+            return default, False
         return requested, False
     picked = colony_type_pick(dominant_task_type(tasks))
     if picked is not None:
@@ -446,15 +498,18 @@ def retire_colony_profile(colony_type: str, reason: str = "type removed") -> boo
     The card is kept on disk, not deleted. Returns False if no
     card exists.
     """
-    with _LOCK, _colony_card_lock(_colony_card_path(colony_type)):
-        card = _load_colony_card(colony_type)
-        if card["samples"] == 0 and card["last_updated"] is None:
-            return False
-        card["stale"] = True
-        card["stale_reason"] = reason
-        card["trusted"] = False
-        card["last_updated"] = datetime.now(timezone.utc).isoformat()
-        return _save_colony_card(card)
+    try:
+        with _LOCK, _colony_card_lock(_colony_card_path(colony_type)):
+            card = _load_colony_card(colony_type)
+            if card["samples"] == 0 and card["last_updated"] is None:
+                return False
+            card["stale"] = True
+            card["stale_reason"] = reason
+            card["trusted"] = False
+            card["last_updated"] = datetime.now(timezone.utc).isoformat()
+            return _save_colony_card(card)
+    except (_ColonyLockUnavailable, OSError, ValueError, TypeError):
+        return False
 
 
 def prune_stale_colony_profiles() -> List[str]:
@@ -474,7 +529,7 @@ def prune_stale_colony_profiles() -> List[str]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 card = json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             continue
         if not isinstance(card, dict):
             continue

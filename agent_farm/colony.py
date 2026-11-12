@@ -51,7 +51,12 @@ def create_bug(colony_id: str, role: str) -> Bug:
 def spawn_colony_internal(colony_type: str = "standard") -> Colony:
     """Spawn a new colony with bugs based on type"""
     colony_id = _unique_id("colony")
-    
+    # Normalize an unsupported type to "standard" for both the
+    # roles and the stored colony_type: an unknown type must not
+    # be reported as if it were built.
+    if colony_type not in ("standard", "fast", "heavy", "hybrid"):
+        colony_type = "standard"
+
     if colony_type == "fast":
         # Speed-focused: more scouts, fewer heavy bugs
         roles = ["scout", "scout", "worker", "worker"]
