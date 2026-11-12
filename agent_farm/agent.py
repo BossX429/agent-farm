@@ -17,6 +17,7 @@ from .tools import (
     execute_tool,
     TOOL_REGISTRY
 )
+from .colony_profiles import record_colony_run
 from .profiles import (
     TASK_TYPE_ROLES,
     classify_result,
@@ -711,7 +712,7 @@ def get_best_bug_for_task(task: Dict, bugs: List) -> 'Bug':
         return workers[0]
     return bugs[0]
 
-def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Dict]:
+def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False, colony_type: Optional[str] = None) -> List[Dict]:
     """Run tool-enabled agents in parallel.
 
     Tasks with ``path`` + ``content`` are direct file writes: they are
@@ -841,6 +842,22 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                     card_success,
                     failure_kind,
                 )
+                # Colony-type measurement: when the caller knows
+                # the colony type, the same run feeds its card
+                # too, so tool_swarm work counts alongside
+                # quick_swarm work. record_colony_run never
+                # raises, so profiling cannot break the swarm.
+                colony_saved = (
+                    record_colony_run(
+                        colony_type,
+                        task_type,
+                        elapsed,
+                        card_success,
+                        failure_kind,
+                    )
+                    if colony_type
+                    else False
+                )
                 results.append({
                     "bug_id": bug.id,
                     "role": bug.role,
@@ -853,6 +870,7 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                     "mode": result.get("mode", "unknown"),
                     "elapsed_seconds": round(elapsed, 2),
                     "profile_saved": saved,
+                    "colony_profile_saved": colony_saved,
                     "profiled": profiled,
                 })
             except Exception as e:
@@ -866,6 +884,13 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                     False,
                     "error",
                 )
+                colony_saved = (
+                    record_colony_run(
+                        colony_type, task_type, elapsed, False, "error"
+                    )
+                    if colony_type
+                    else False
+                )
                 results.append({
                     "bug_id": bug.id,
                     "role": bug.role,
@@ -873,6 +898,7 @@ def run_tool_swarm(tasks: List[Dict], bugs: List, deep: bool = False) -> List[Di
                     "status": "failed",
                     "elapsed_seconds": round(elapsed, 2),
                     "profile_saved": saved,
+                    "colony_profile_saved": colony_saved,
                     "profiled": profiled,
                 })
 

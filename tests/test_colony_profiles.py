@@ -241,6 +241,56 @@ def test_spawn_prunes_stale_colony_cards(monkeypatch, tmp_path):
     assert not orphan_path.exists()
 
 
+def test_tool_swarm_run_feeds_colony_card(monkeypatch):
+    # Tool-swarm work lands on the colony type's card too, when
+    # the caller passes the colony type. Without it, the colony
+    # card is never fed: the re-review caught that tool_swarm
+    # runs through agent.run_tool_swarm, not execute_parallel_swarm.
+    import agent_farm.agent as agent_module
+    from agent_farm.agent import run_tool_swarm
+
+    def _fake_agent(role, model, task, context="", deep=False):
+        return {
+            "answer": "done", "tool_calls": [],
+            "iterations": 1, "status": "completed", "mode": "test",
+        }
+
+    monkeypatch.setattr(agent_module, "run_tool_agent", _fake_agent)
+    colony = spawn_colony_internal("hybrid")
+    results = run_tool_swarm(
+        [{"prompt": "list files in the folder"}],
+        colony.bugs,
+        colony_type=colony.colony_type,
+    )
+    assert len(results) == 1
+    assert results[0]["colony_profile_saved"] is True
+    card = get_colony_profile("hybrid")
+    assert card is not None
+    assert card["samples"] == 1
+    assert card["per_task_type"]["list"]["samples"] == 1
+
+
+def test_tool_swarm_without_colony_type_skips_colony_card(monkeypatch):
+    # Callers with no colony type (health/recon/deep swarms build
+    # ad-hoc bugs, not a colony type) must not invent one: no
+    # colony card is recorded and the flag says so.
+    import agent_farm.agent as agent_module
+    from agent_farm.agent import run_tool_swarm
+
+    def _fake_agent(role, model, task, context="", deep=False):
+        return {
+            "answer": "done", "tool_calls": [],
+            "iterations": 1, "status": "completed", "mode": "test",
+        }
+
+    monkeypatch.setattr(agent_module, "run_tool_agent", _fake_agent)
+    colony = spawn_colony_internal("hybrid")
+    results = run_tool_swarm([{"prompt": "list files in the folder"}], colony.bugs)
+    assert len(results) == 1
+    assert results[0]["colony_profile_saved"] is False
+    assert get_colony_profile("hybrid") is None
+
+
 def test_quick_swarm_auto_picks_trusted_type(monkeypatch):
     import agent_farm.colony_tools as colony_tools_module
     import agent_farm.server as server

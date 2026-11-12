@@ -797,7 +797,7 @@ async def tool_swarm(tasks: str, colony_type: str = "auto", deep: bool = False, 
     probe_summary = None
     if run_probes:
         probe_summary = await _probe_summary_for(colony)
-    bug_results = await asyncio.to_thread(run_tool_swarm, bug_tasks, colony.bugs, deep) if bug_tasks else []
+    bug_results = await asyncio.to_thread(run_tool_swarm, bug_tasks, colony.bugs, deep, colony.colony_type) if bug_tasks else []
     results = direct_results + bug_results
 
     
