@@ -28,6 +28,7 @@ from .profiles import (
     record_profile_run,
     task_type_for_prompt,
 )
+from .colony_profiles import record_colony_run
 
 def _unique_id(prefix: str) -> str:
     """Unique, human-readable ID.
@@ -65,7 +66,7 @@ def spawn_colony_internal(colony_type: str = "standard") -> Colony:
         roles = ["scout", "worker", "worker", "memory"]
     
     bugs = [create_bug(colony_id, role) for role in roles]
-    colony = Colony(id=colony_id, bugs=bugs)
+    colony = Colony(id=colony_id, bugs=bugs, colony_type=colony_type)
     colonies[colony_id] = colony
     stats["colonies_spawned"] += 1
     
@@ -234,6 +235,18 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
             result["profile_saved"] = record_profile_run(
                 bug.role,
                 bug.model,
+                task_type,
+                elapsed,
+                card_success,
+                failure_kind,
+            )
+            # Colony-type measurement: the same run feeds the
+            # colony type's card, once per task, so a card's
+            # per-task-type entries say how that colony type did
+            # on that kind of work. record_colony_run never
+            # raises, so profiling cannot break the swarm.
+            result["colony_profile_saved"] = record_colony_run(
+                colony.colony_type,
                 task_type,
                 elapsed,
                 card_success,

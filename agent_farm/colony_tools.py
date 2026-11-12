@@ -12,6 +12,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from . import probes
 from .mcp_app import mcp
 from .metrics import track_tool_run
+from .colony_profiles import (
+    colony_profiles_summary,
+    prune_stale_colony_profiles,
+    resolve_colony_type,
+)
 from .profiles import profiles_summary, prune_stale_profiles
 from .state import MODEL_TIERS, OLLAMA_URL, colonies, stats
 from .colony import (
@@ -77,6 +82,7 @@ async def spawn_colony(colony_type: str = "standard", run_probes: bool = True) -
     # combo no bug can use anymore) are removed on every spawn,
     # so they can never accumulate. The prune never raises.
     prune_stale_profiles()
+    prune_stale_colony_profiles()
     probe_summary = None
     if run_probes:
         probe_summary = await _probe_summary_for(colony)
@@ -127,7 +133,7 @@ async def deploy_swarm(colony_id: str, tasks: str) -> dict:
 
 @mcp.tool()
 @track_tool_run()
-async def quick_swarm(tasks: str, colony_type: str = "fast", run_probes: bool = True) -> dict:
+async def quick_swarm(tasks: str, colony_type: str = "auto", run_probes: bool = True) -> dict:
     """
     One-shot: spawn colony + deploy swarm + return results
     tasks: JSON array or single prompt string
@@ -137,19 +143,28 @@ async def quick_swarm(tasks: str, colony_type: str = "fast", run_probes: bool = 
     the tasks, and the results land on the profile cards in
     profiles/. Probing costs extra model calls and time before
     the tasks run.
+
+    Colony-type measurement (Phase 3): colony_type defaults to
+    "auto", which picks the best colony type for the tasks from
+    trusted colony-type cards and falls back to "fast" when no
+    card qualifies, so behaviour is unchanged until cards are
+    trusted. An explicit type is always used as-is.
     """
     payload_error = validate_parallel_payload(tasks, "tasks")
     if payload_error:
         return {"error": payload_error}
-    colony = spawn_colony_internal(colony_type)
-    # Stale profile cards are removed on every spawn, so they
-    # can never accumulate. The prune never raises.
-    prune_stale_profiles()
-
     try:
         task_list = json.loads(tasks)
     except (json.JSONDecodeError, TypeError):
         task_list = [{"prompt": tasks}]
+    colony_type, colony_type_profiled = resolve_colony_type(
+        colony_type, task_list, "fast"
+    )
+    colony = spawn_colony_internal(colony_type)
+    # Stale profile cards are removed on every spawn, so they
+    # can never accumulate. The prune never raises.
+    prune_stale_profiles()
+    prune_stale_colony_profiles()
 
     items_error = validate_parallel_items(task_list, "tasks")
     if items_error:
@@ -163,6 +178,8 @@ async def quick_swarm(tasks: str, colony_type: str = "fast", run_probes: bool = 
     
     return {
         "colony_id": colony.id,
+        "colony_type": colony_type,
+        "colony_type_profiled": colony_type_profiled,
         "tasks": len(task_list),
         "results": results,
         "probes": probe_summary,
@@ -325,6 +342,10 @@ async def farm_stats() -> dict:
         # profile card (role, model, samples, trusted, success
         # rate, avg seconds). Full cards live in profiles/.
         "profiles": profiles_summary(),
+        # Colony-type measurement (Phase 3): one summary line
+        # per stored colony-type card. Full cards live in
+        # colony_profiles/.
+        "colony_profiles": colony_profiles_summary(),
         "observability": {
             "action_log": _action_log_summary(),
         },

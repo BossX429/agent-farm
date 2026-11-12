@@ -78,6 +78,7 @@ class Colony:
     """Bug colony with shared consciousness"""
     id: str
     bugs: List[Bug] = field(default_factory=list)
+    colony_type: str = "standard"
     consciousness: SharedConsciousness = field(default_factory=SharedConsciousness)
     armor: NanoArmor = field(default_factory=NanoArmor)
     created: str = field(default_factory=lambda: datetime.now().isoformat())
