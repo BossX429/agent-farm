@@ -82,6 +82,11 @@ class Colony:
     armor: NanoArmor = field(default_factory=NanoArmor)
     created: str = field(default_factory=lambda: datetime.now().isoformat())
     tasks_completed: int = 0
+    # colony_type goes LAST, not after bugs: a field inserted in
+    # the middle would silently rebind any caller that constructs
+    # Colony(id, bugs, consciousness) positionally, binding the
+    # consciousness object to colony_type.
+    colony_type: str = "standard"
 
 
 # Active colonies

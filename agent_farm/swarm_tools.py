@@ -20,6 +20,7 @@ from .colony import (
     execute_parallel_swarm,
     entangle_colony,
 )
+from .colony_profiles import prune_stale_colony_profiles, resolve_colony_type
 from .colony_tools import _probe_summary_for
 from .profiles import prune_stale_profiles
 from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
@@ -689,7 +690,7 @@ SYNTHESIS (be concise, extract key insights):"""
 
 @mcp.tool()
 @track_tool_run()
-async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False, synthesize: bool = False, run_probes: bool = True) -> dict:
+async def tool_swarm(tasks: str, colony_type: str = "auto", deep: bool = False, synthesize: bool = False, run_probes: bool = True) -> dict:
     """
     Deploy tool-enabled agents that can use real system tools.
     Each bug role has different tool permissions:
@@ -715,19 +716,22 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     probe harness runs automatically after the spawn and before
     the tasks, and the results land on the profile cards in
     profiles/.
+
+    Colony-type measurement (Phase 3): colony_type defaults to
+    "auto", which picks the best colony type for the tasks from
+    trusted colony-type cards and falls back to "hybrid" when no
+    card qualifies, so behaviour is unchanged until cards are
+    trusted. An explicit type is always used as-is.
     """
     import time
     from .agent import run_tool_swarm
     from .tools import execute_tool
     start = time.time()
     
-    # Spawn colony
-    colony = spawn_colony_internal(colony_type)
-    # Stale profile cards are removed on every spawn, so they
-    # can never accumulate. The prune never raises.
-    prune_stale_profiles()
-    
-    # Parse tasks
+    # Parse tasks first: the colony type is resolved from them
+    # when it is "auto", so a bad payload is rejected before any
+    # colony is spawned (previously a colony was spawned first
+    # and left orphaned on invalid input).
     payload_error = validate_parallel_payload(tasks, "tasks")
     if payload_error:
         return {"error": payload_error}
@@ -739,6 +743,17 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     items_error = validate_parallel_items(task_list, "tasks")
     if items_error:
         return {"error": items_error}
+
+    colony_type, colony_type_profiled = resolve_colony_type(
+        colony_type, task_list, "hybrid"
+    )
+
+    # Spawn colony
+    colony = spawn_colony_internal(colony_type)
+    # Stale profile cards are removed on every spawn, so they
+    # can never accumulate. The prune never raises.
+    prune_stale_profiles()
+    prune_stale_colony_profiles()
 
     # DIRECT EXECUTE: Intercept heavy write tasks - bugs can't echo long content
     CONTENT_THRESHOLD = 300  # chars - below this bugs handle fine
@@ -782,7 +797,7 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     probe_summary = None
     if run_probes:
         probe_summary = await _probe_summary_for(colony)
-    bug_results = await asyncio.to_thread(run_tool_swarm, bug_tasks, colony.bugs, deep) if bug_tasks else []
+    bug_results = await asyncio.to_thread(run_tool_swarm, bug_tasks, colony.bugs, deep, colony.colony_type) if bug_tasks else []
     results = direct_results + bug_results
 
     
@@ -798,6 +813,7 @@ async def tool_swarm(tasks: str, colony_type: str = "hybrid", deep: bool = False
     return {
         "colony_id": colony.id,
         "colony_type": colony_type,
+        "colony_type_profiled": colony_type_profiled,
         "tasks": len(task_list),
         "deep_mode": deep,
         "results": results,
