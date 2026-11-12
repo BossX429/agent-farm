@@ -79,8 +79,15 @@ def test_record_runs_accumulate_and_trust():
     assert card["per_task_type"]["write"]["avg_seconds"] == 2.0
     # Only one task type is trusted: the card is not trusted yet.
     assert card["trusted"] is False
+    # One sample per remaining type is not enough either: a
+    # threshold weakened to 1 sample per type would trust the
+    # card here, and the old test would not have noticed.
     for task_type in ("analyze", "search", "check", "list"):
-        for _ in range(MIN_SAMPLES_PER_TYPE):
+        assert record_colony_run("fast", task_type, 1.0, True)
+    card = get_colony_profile("fast")
+    assert card["trusted"] is False
+    for task_type in ("analyze", "search", "check", "list"):
+        for _ in range(MIN_SAMPLES_PER_TYPE - 1):
             assert record_colony_run("fast", task_type, 1.0, True)
     card = get_colony_profile("fast")
     assert card["trusted"] is True
@@ -147,12 +154,33 @@ def test_dominant_task_type():
     assert dominant_task_type([{"prompt": "hello"}]) == "general"
 
 
+def _trust_card_for_type(colony_type, good_type):
+    """Trust a card that is good at one type and bad at the rest.
+
+    Every probe type gets 5 samples (so the card is trusted),
+    but only good_type succeeds; the others fail. That makes the
+    pick task-specific: a write task and an analyze task must
+    choose different cards.
+    """
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            assert record_colony_run(
+                colony_type, task_type, 1.0, task_type == good_type
+            )
+
+
 def test_resolve_colony_type_auto_picks_trusted():
-    _trust_card("heavy")
+    _trust_card_for_type("heavy", "write")
+    _trust_card_for_type("standard", "analyze")
     colony_type, profiled = resolve_colony_type(
         "auto", [{"prompt": "write a function"}], "fast"
     )
     assert colony_type == "heavy"
+    assert profiled is True
+    colony_type, profiled = resolve_colony_type(
+        "auto", [{"prompt": "analyze code for bugs"}], "fast"
+    )
+    assert colony_type == "standard"
     assert profiled is True
 
 
@@ -194,6 +222,140 @@ def test_prune_keeps_current_cards(monkeypatch, tmp_path):
         assert record_colony_run(colony_type, "write", 1.0, True)
     assert prune_stale_colony_profiles() == []
     assert len(list_colony_profiles()) == len(COLONY_TYPES)
+
+
+def test_pick_uses_unrounded_metrics():
+    # Two trusted cards whose rounded success rate and avg seconds
+    # are identical (1.0 and 2.0) but whose unrounded averages
+    # differ: fast averages 2.004s, heavy 2.001s. The pick must
+    # choose heavy (faster unrounded). A pick that compared the
+    # rounded values would tie and fall back to sorted card order,
+    # choosing fast.
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            assert record_colony_run("fast", task_type, 2.004, True)
+            assert record_colony_run("heavy", task_type, 2.001, True)
+    assert colony_type_pick("write") == "heavy"
+
+
+def test_malformed_extra_entry_is_dropped(monkeypatch, tmp_path):
+    # A stored card with an unknown per_task_type key whose value
+    # lacks the expected fields must not crash recording: the
+    # normalize step drops unknown keys.
+    from agent_farm.colony_profiles import _colony_card_path, _save_colony_card
+
+    monkeypatch.setenv("AGENT_FARM_COLONY_PROFILES_DIR", str(tmp_path))
+    card = create_colony_profile("fast")
+    card["per_task_type"]["bogus"] = {"wrong": "shape"}
+    assert _save_colony_card(card)
+    assert record_colony_run("fast", "write", 1.0, True) is True
+    loaded = get_colony_profile("fast")
+    assert loaded is not None
+    assert "bogus" not in loaded["per_task_type"]
+    assert loaded["samples"] == 1
+
+
+def test_corrupt_card_bytes_do_not_break_recording(monkeypatch, tmp_path):
+    # A card file with invalid UTF-8 bytes must be treated as
+    # unusable, not raise UnicodeDecodeError out of recording,
+    # listing, or pruning.
+    from agent_farm.colony_profiles import _colony_card_path
+
+    monkeypatch.setenv("AGENT_FARM_COLONY_PROFILES_DIR", str(tmp_path))
+    path = _colony_card_path("fast")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\xff\xfe not json \x80\x81")
+    assert record_colony_run("fast", "write", 1.0, True) is True
+    assert get_colony_profile("fast") is not None
+    assert list_colony_profiles() != []
+    assert prune_stale_colony_profiles() == []
+
+
+def test_unsupported_explicit_type_falls_back():
+    colony_type, profiled = resolve_colony_type(
+        "auto", [{"prompt": "write a function"}], "fast"
+    )
+    assert colony_type == "fast"
+    colony_type, profiled = resolve_colony_type(
+        "mega", [{"prompt": "write a function"}], "fast"
+    )
+    assert colony_type == "fast"
+    assert profiled is False
+    # An unsupported type never gains a card.
+    assert record_colony_run("mega", "write", 1.0, True) is False
+    assert get_colony_profile("mega") is None
+
+
+def test_spawn_normalizes_unsupported_type():
+    colony = spawn_colony_internal("mega")
+    assert colony.colony_type == "standard"
+    assert [bug.role for bug in colony.bugs] == [
+        "scout", "worker", "worker", "memory",
+    ]
+
+
+def test_positional_colony_construction():
+    # Colony(id, bugs, consciousness) positionally must still bind
+    # consciousness correctly: colony_type is the LAST field, not
+    # the third, so it cannot silently capture the consciousness
+    # object.
+    from agent_farm.state import Bug, Colony, SharedConsciousness
+
+    consciousness = SharedConsciousness()
+    colony = Colony("c1", [Bug(id="b1", role="worker", model="qwen3:4b")], consciousness)
+    assert colony.consciousness is consciousness
+    assert colony.colony_type == "standard"
+
+
+def test_dominant_task_type_handles_bad_input():
+    assert dominant_task_type({"prompt": "write a function"}) == "general"
+    assert dominant_task_type([{"prompt": "write a function"}, "not a dict"]) == "write"
+    assert dominant_task_type([None, 42]) == "general"
+
+
+def test_quick_swarm_object_tasks_returns_validation_error(monkeypatch):
+    # A JSON object (not a list) must return the validation error,
+    # not crash in dominant_task_type before validation runs.
+    import agent_farm.server as server
+
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
+    result = asyncio.run(
+        server.quick_swarm('{"prompt": "write a function"}', run_probes=False)
+    )
+    assert "error" in result
+
+
+def test_stale_lock_is_recovered(monkeypatch, tmp_path):
+    # A lock file older than 30 seconds is treated as stale (its
+    # process died) and removed, so recording proceeds.
+    import os
+    import time
+    from agent_farm.colony_profiles import _colony_card_path
+
+    monkeypatch.setenv("AGENT_FARM_COLONY_PROFILES_DIR", str(tmp_path))
+    path = _colony_card_path("fast")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    lock_path.touch()
+    old = time.time() - 60.0
+    os.utime(lock_path, (old, old))
+    assert record_colony_run("fast", "write", 1.0, True) is True
+    assert not lock_path.exists()
+
+
+def test_lock_timeout_skips_update(monkeypatch, tmp_path):
+    # A lock held by another process (fresh, not stale) must not
+    # be yielded without ownership: recording returns False
+    # instead of overwriting another recorder's samples.
+    from agent_farm.colony_profiles import _colony_card_path
+
+    monkeypatch.setenv("AGENT_FARM_COLONY_PROFILES_DIR", str(tmp_path))
+    path = _colony_card_path("fast")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    lock_path.touch()
+    assert record_colony_run("fast", "write", 1.0, True) is False
+    assert get_colony_profile("fast") is None
 
 
 def test_record_never_raises_on_bad_input():
@@ -335,11 +497,11 @@ def test_tool_swarm_without_colony_type_skips_colony_card(monkeypatch):
 
 
 def test_quick_swarm_auto_picks_trusted_type(monkeypatch):
-    import agent_farm.colony_tools as colony_tools_module
     import agent_farm.server as server
 
     monkeypatch.setattr(colony_module, "sync_query_ollama", _fake_ok)
-    _trust_card("heavy")
+    _trust_card_for_type("heavy", "write")
+    _trust_card_for_type("standard", "analyze")
     result = asyncio.run(
         server.quick_swarm(
             json.dumps([{"prompt": "write a function that adds two numbers"}]),
@@ -347,6 +509,14 @@ def test_quick_swarm_auto_picks_trusted_type(monkeypatch):
         )
     )
     assert result["colony_type"] == "heavy"
+    assert result["colony_type_profiled"] is True
+    result = asyncio.run(
+        server.quick_swarm(
+            json.dumps([{"prompt": "analyze code for bugs"}]),
+            run_probes=False,
+        )
+    )
+    assert result["colony_type"] == "standard"
     assert result["colony_type_profiled"] is True
 
 
