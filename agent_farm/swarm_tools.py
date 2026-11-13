@@ -710,7 +710,7 @@ async def tool_swarm(tasks: str, colony_type: str = "auto", deep: bool = False, 
     Bugs can't reliably echo long content - we write directly instead.
     
     deep: Enable deep work mode - bugs chain multiple tool calls for complex tasks
-    synthesize: If True, uses qwen2.5:14b to synthesize results into unified summary
+    synthesize: If True, uses qwen3:30b-a3b-q3k to synthesize results into unified summary
 
     Profiler factory Phase 2: unless run_probes is False, the
     probe harness runs automatically after the spawn and before
@@ -830,7 +830,7 @@ async def system_health_swarm(synthesize: bool = True) -> dict:
     Quick system health check using tool-enabled bugs.
     Deploys guardian bugs to check CPU, memory, disk, and services.
     
-    synthesize: If True (default), uses qwen2.5:14b to synthesize results into unified summary
+    synthesize: If True (default), uses qwen3:30b-a3b-q3k to synthesize results into unified summary
     """
     import time
     from .agent import run_tool_swarm
@@ -884,7 +884,7 @@ async def recon_swarm(target_path: str, deep: bool = False, synthesize: bool = T
     
     target_path: Directory to explore
     deep: Enable deep work mode (default False) - multi-iteration for complex analysis
-    synthesize: If True (default), uses qwen2.5:14b to synthesize findings into unified report
+    synthesize: If True (default), uses qwen3:30b-a3b-q3k to synthesize findings into unified report
     """
     import time
     from .agent import run_tool_swarm
@@ -1004,7 +1004,7 @@ async def deep_analysis_swarm(target_path: str, analysis_type: str = "full", syn
     
     target_path: Directory/path to analyze
     analysis_type: 'full', 'redundant', 'sizes', 'cleanup'
-    synthesize: If True (default), uses qwen2.5:14b to synthesize findings
+    synthesize: If True (default), uses qwen3:30b-a3b-q3k to synthesize findings
     
     Use this for finding: redundant files, cache sizes, disk usage, log files, etc.
     """
@@ -1080,7 +1080,7 @@ async def deep_analysis_swarm(target_path: str, analysis_type: str = "full", syn
 async def synthesize(results: str, context: str = "") -> dict:
     """
     Standalone synthesis tool - synthesize any JSON results into unified summary.
-    Uses qwen2.5:14b for accuracy.
+    Uses qwen3:30b-a3b-q3k for accuracy.
     
     results: JSON array of result objects (with 'answer' or 'response' keys)
     context: Optional context about what these results are from

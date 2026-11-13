@@ -14,6 +14,45 @@ from .state import MODEL_TIERS, OLLAMA_URL, GROUNDING
 from .reliability import MODEL_SEMAPHORE
 
 
+def strip_think_blocks(text: str) -> str:
+    """Remove Qwen3 <think>...</think> reasoning blocks.
+
+    A qwen3 model emits its reasoning inside <think> tags. The
+    grounded paths suppress this with "/nothink", but the raw and
+    synthesis paths do not use grounding, so callers would receive
+    reasoning text in code, tests, reviews, or summaries. An
+    unclosed block (model cut off mid-thought) is removed to the
+    end of the string. A response with no block is returned
+    unchanged.
+    """
+    if not isinstance(text, str):
+        return text
+    if "<think>" not in text and "</think>" not in text:
+        return text
+    out = []
+    rest = text
+    while True:
+        start = rest.find("<think>")
+        if start == -1:
+            # No opening tag left. A dangling </think> means the
+            # text before it is reasoning (the model emitted the
+            # close without the open); drop everything up to and
+            # including it and keep what follows.
+            end = rest.find("</think>")
+            if end == -1:
+                out.append(rest)
+            else:
+                out.append(rest[end + len("</think>"):])
+            break
+        out.append(rest[:start])
+        end = rest.find("</think>", start)
+        if end == -1:
+            # Unclosed block: drop everything from <think> onward.
+            break
+        rest = rest[end + len("</think>"):]
+    return "".join(out).strip()
+
+
 async def query_ollama(model: str, prompt: str, grounded: bool = True) -> str:
     """Query Ollama with optional grounding instruction"""
     full_prompt = f"{GROUNDING}\n\n{prompt}" if grounded else prompt
@@ -25,7 +64,7 @@ async def query_ollama(model: str, prompt: str, grounded: bool = True) -> str:
                 timeout=120.0
             )
             if resp.status_code == 200:
-                return resp.json().get("response", "No response")
+                return strip_think_blocks(resp.json().get("response", "No response"))
             return f"Error: {resp.status_code}"
     except Exception as e:
         return f"Error: {str(e)}"
@@ -56,7 +95,7 @@ def sync_query_ollama(model: str, prompt: str, grounded: bool = True, slot_held:
                 timeout=120.0
             )
             if resp.status_code == 200:
-                return resp.json().get("response", "No response")
+                return strip_think_blocks(resp.json().get("response", "No response"))
             return f"Error: {resp.status_code}"
     except Exception as e:
         return f"Error: {str(e)}"
@@ -72,7 +111,7 @@ def sync_query_raw(model: str, prompt: str) -> str:
                 timeout=300.0  # 5 min for complex analysis
             )
             if resp.status_code == 200:
-                return resp.json().get("response", "No response")
+                return strip_think_blocks(resp.json().get("response", "No response"))
             return f"Error: {resp.status_code}"
     except Exception as e:
         return f"Error: {str(e)}"
@@ -81,7 +120,7 @@ def sync_query_raw(model: str, prompt: str) -> str:
 def synthesize_swarm_results(results: List[Dict], task_context: str = "") -> str:
     """
     Synthesize swarm results into a unified summary using the synthesizer model.
-    Uses the synthesizer tier (qwen2.5:14b) for accuracy; no model
+    Uses the synthesizer tier (qwen3:30b-a3b-q3k) for accuracy; no model
     guarantees zero hallucinations, so summaries still need checking.
     
     Args:
@@ -138,8 +177,9 @@ SYNTHESIZED SUMMARY:"""
             )
             if resp.status_code == 200:
                 response = resp.json().get("response", "Synthesis failed")
-                # Clean up common artifacts
-                response = response.strip()
+                # Clean up common artifacts, including the <think>
+                # block a qwen3 model emits when no "/nothink" is set.
+                response = strip_think_blocks(response)
                 if response.startswith("SYNTHESIZED SUMMARY:"):
                     response = response[20:].strip()
                 return response

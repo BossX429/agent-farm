@@ -15,7 +15,7 @@ Now with **Chunked Write Pattern** for generating large documents and code files
 
 - Parallel execution via ThreadPoolExecutor (no measured speedup claim is made)
 - **1 iteration** per task (was 3-5)
-- **Local synthesis** - qwen2.5:14b synthesizes results (no cloud tokens!)
+- **Local synthesis** - qwen3:30b-a3b-q3k synthesizes results (no cloud tokens!)
 
 ## Security
 
@@ -177,7 +177,11 @@ planner does not stall the async event loop.
 | Memory | qwen3:4b | 2.5GB | Context retention |
 | Guardian | qwen3:4b | 2.5GB | System monitoring |
 | Learner | qwen2.5-coder:7b-v8-review | 8.1GB | Pattern acquisition (code-tuned) |
-| **Synthesizer** | **qwen2.5:14b** | **8.99GB** | **Result synthesis** |
+| **Synthesizer** | **qwen3:30b-a3b-q3k** | **14.7GB** | **Result synthesis** |
+
+> **Prerequisite:** pull the synthesizer model before upgrading, or
+> synthesis and code review fail with a model-not-found error:
+> `ollama pull qwen3:30b-a3b-q3k` (14.7GB).
 
 Code review, code generation, and KMKB synthesis use the synthesizer tier,
 not a separate model.
@@ -260,7 +264,7 @@ Results now include a `mode` field showing which method was used:
 The chunked write pattern solves the ~500 char output limitation of small models by decomposing large tasks:
 
 ```
-1. PLANNER BUG (qwen2.5:14b)
+1. PLANNER BUG (qwen2.5-coder:7b-v8-review)
    |-- Creates structured JSON outline
    |-- {"sections": [{"title": "...", "description": "..."}]}
 
@@ -417,7 +421,7 @@ uv pip install -e .
 - All roles get exec_cmd for complex shell queries
 
 ### v3.2.0 (2026-01-22)
-- **Synthesizer role** - qwen2.5:14b for accurate result synthesis
+- **Synthesizer role** - qwen3:30b-a3b-q3k for accurate result synthesis
 - **synthesize parameter** - Added to tool_swarm, system_health_swarm, recon_swarm, deep_analysis_swarm
 - **synthesize tool** - Standalone synthesis of any JSON results
 - **No more Claude synthesis tax** - bugs do ALL the work locally

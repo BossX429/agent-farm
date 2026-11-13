@@ -322,7 +322,7 @@ def test_mixed_model_roles_are_distinct():
     # Roles deliberately run different models: the code-facing
     # roles (worker writes code, learner analyzes it) use the
     # code-tuned model, the fast roles stay on qwen3:4b, and the
-    # synthesizer keeps qwen2.5:14b. If every role ran the same
+    # synthesizer keeps qwen3:30b-a3b-q3k. If every role ran the same
     # model, the profiler would measure timing noise between
     # identical workers instead of real differences.
     assert MODEL_TIERS["worker"] == "qwen2.5-coder:7b-v8-review"
@@ -330,7 +330,82 @@ def test_mixed_model_roles_are_distinct():
     assert MODEL_TIERS["scout"] == "qwen3:4b"
     assert MODEL_TIERS["memory"] == "qwen3:4b"
     assert MODEL_TIERS["guardian"] == "qwen3:4b"
-    assert MODEL_TIERS["synthesizer"] == "qwen2.5:14b"
+    assert MODEL_TIERS["synthesizer"] == "qwen3:30b-a3b-q3k"
+
+def test_strip_think_blocks_removes_reasoning():
+    from agent_farm.ollama import strip_think_blocks
+
+    assert strip_think_blocks("plain answer") == "plain answer"
+    assert strip_think_blocks(
+        "<think>Thinking out loud</think>\n\nThe actual answer."
+    ) == "The actual answer."
+    # A <think> block in the middle is removed, the rest kept.
+    assert strip_think_blocks(
+        "Before <think>reasoning here</think> after."
+    ) == "Before  after."
+    # An unclosed block is dropped to the end of the string.
+    assert strip_think_blocks("Answer <think>never closed") == "Answer"
+    # Multiple blocks are all removed.
+    assert strip_think_blocks(
+        "<think>one</think>keep<think>two</think> this"
+    ) == "keep this"
+    # A dangling </think> (reasoning text with no opening tag)
+    # drops everything up to and including the close tag.
+    assert strip_think_blocks(
+        "Reasoning with no opening tag.</think>\n\nThe answer."
+    ) == "The answer."
+
+
+def test_synthesis_strips_think_block(monkeypatch):
+    # The synthesis path makes a direct httpx call with no
+    # "/nothink", so a qwen3 model thinks out loud. The returned
+    # summary must not contain the reasoning block.
+    import httpx
+    import agent_farm.ollama as ollama_module
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "response": (
+                    "<think>Let me think about these findings.</think>"
+                    "\n\n- Local AI keeps data private."
+                )
+            }
+
+    class _FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, *args, **kwargs):
+            return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    result = ollama_module.synthesize_swarm_results(
+        [{"role": "worker", "task": "write a note", "answer": "Local AI keeps data private.", "status": "success"}],
+        "local AI",
+    )
+    assert "<think>" not in result
+    assert "Let me think" not in result
+    assert "Local AI keeps data private" in result
+
+
+def test_synthesizer_is_the_30b_reasoning_model():
+    # The synthesizer is the heavy-reasoning role: it runs AFTER
+    # colony work completes, so Ollama evicts the finished colony
+    # models to make room for the 14.7GB 30b. It must be the 30b
+    # (not the old 14b), and it must be distinct from every colony
+    # role's model, so the profiler measures a real difference.
+    assert MODEL_TIERS["synthesizer"] == "qwen3:30b-a3b-q3k"
+    colony_models = {
+        MODEL_TIERS[role]
+        for role in ("scout", "worker", "memory", "guardian", "learner")
+    }
+    assert MODEL_TIERS["synthesizer"] not in colony_models
     # At least two different models are actually in use.
     assert len(set(MODEL_TIERS.values())) >= 3
 
