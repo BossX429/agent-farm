@@ -85,6 +85,13 @@ def create_colony_profile(colony_type: str) -> Dict[str, Any]:
             "total_seconds": 0.0,
             "avg_seconds": 0.0,
             "trusted": False,
+            # Correctness: how many usable answers were checked
+            # against the job's known answer, and how many were
+            # right. Only probe runs check answers, so checked is
+            # usually smaller than samples.
+            "checked": 0,
+            "correct": 0,
+            "correctness_rate": 0.0,
         }
         for task_type in TASK_TYPES
     }
@@ -97,6 +104,9 @@ def create_colony_profile(colony_type: str) -> Dict[str, Any]:
         "success_rate": 0.0,
         "total_seconds": 0.0,
         "avg_seconds": 0.0,
+        "checked": 0,
+        "correct": 0,
+        "correctness_rate": 0.0,
         "per_task_type": per_type,
         "failure_modes": {},
         "trusted": False,
@@ -111,6 +121,10 @@ def _refresh_colony_card(card: Dict[str, Any]) -> None:
     samples = card["samples"]
     card["success_rate"] = round(card["successes"] / samples, 2) if samples else 0.0
     card["avg_seconds"] = round(card["total_seconds"] / samples, 2) if samples else 0.0
+    checked = card.get("checked", 0)
+    card["correctness_rate"] = (
+        round(card.get("correct", 0) / checked, 2) if checked else 0.0
+    )
     for task_type, entry in card["per_task_type"].items():
         type_samples = entry["samples"]
         entry["success_rate"] = (
@@ -120,6 +134,10 @@ def _refresh_colony_card(card: Dict[str, Any]) -> None:
             round(entry["total_seconds"] / type_samples, 2) if type_samples else 0.0
         )
         entry["trusted"] = type_samples >= MIN_SAMPLES_PER_TYPE
+        type_checked = entry.get("checked", 0)
+        entry["correctness_rate"] = (
+            round(entry.get("correct", 0) / type_checked, 2) if type_checked else 0.0
+        )
     # Trusted only when every probe task type has enough samples,
     # and only while it is not stale. "general" runs do not count
     # toward trust: they are unclassified work, not a measured
@@ -162,6 +180,13 @@ def _normalize_colony_card(card: Any, colony_type: str) -> Optional[Dict[str, An
     for key in ("success_rate", "total_seconds", "avg_seconds"):
         if not _is_number(card.get(key)):
             card[key] = 0.0
+    # Cards written before correctness was measured have no
+    # checked / correct fields; they start at zero.
+    for key in ("checked", "correct"):
+        if not _is_int(card.get(key)):
+            card[key] = 0
+    if not _is_number(card.get("correctness_rate")):
+        card["correctness_rate"] = 0.0
     per_type = card.get("per_task_type")
     if not isinstance(per_type, dict):
         per_type = {}
@@ -184,6 +209,11 @@ def _normalize_colony_card(card: Any, colony_type: str) -> Optional[Dict[str, An
         for key in ("success_rate", "total_seconds", "avg_seconds"):
             if not _is_number(entry.get(key)):
                 entry[key] = 0.0
+        for key in ("checked", "correct"):
+            if not _is_int(entry.get(key)):
+                entry[key] = 0
+        if not _is_number(entry.get("correctness_rate")):
+            entry["correctness_rate"] = 0.0
         if not isinstance(entry.get("trusted"), bool):
             entry["trusted"] = False
     modes = card.get("failure_modes")
@@ -352,6 +382,9 @@ def colony_profiles_summary() -> List[Dict[str, Any]]:
             "success_rate": card["success_rate"],
             "avg_seconds": card["avg_seconds"],
             "stale": card["stale"],
+            "checked": card.get("checked", 0),
+            "correct": card.get("correct", 0),
+            "correctness_rate": card.get("correctness_rate", 0.0),
         }
         for card in list_colony_profiles()
     ]
@@ -363,6 +396,7 @@ def record_colony_run(
     elapsed_seconds: float,
     success: bool,
     failure_kind: Optional[str] = None,
+    correct: Optional[bool] = None,
 ) -> bool:
     """Record one measured task run on a colony type's card.
 
@@ -391,12 +425,26 @@ def record_colony_run(
                     modes = card["failure_modes"]
                     modes[failure_kind] = modes.get(failure_kind, 0) + 1
             card["total_seconds"] += max(0.0, elapsed)
+            # Correctness is recorded only when the answer was
+            # checked (a usable answer with a checker) AND the run
+            # succeeded. A failed response is a failure, not a
+            # checked answer, even if a caller passes a correct
+            # value alongside success=False.
+            correct = correct if success else None
+            if correct is not None:
+                card["checked"] += 1
+                if correct:
+                    card["correct"] += 1
             entry = card["per_task_type"][task_type]
             entry["samples"] += 1
             if success:
                 entry["successes"] += 1
             else:
                 entry["failures"] += 1
+            if correct is not None:
+                entry["checked"] += 1
+                if correct:
+                    entry["correct"] += 1
             entry["total_seconds"] += max(0.0, elapsed)
             _refresh_colony_card(card)
             return _save_colony_card(card)
@@ -418,10 +466,19 @@ def colony_type_pick(task_type: str) -> Optional[str]:
     """Pick the best colony type for a task type from measured evidence.
 
     Among types with a trusted, non-stale card for this machine
-    whose entry for the task type is trusted, the highest success
-    rate wins, then the fastest. Returns None when no card
-    qualifies: the caller falls back to its old default, so
-    behaviour is unchanged until cards are trusted.
+    whose entry for the task type is trusted, the highest
+    correctness wins, then the highest success rate, then the
+    fastest. Correctness is the entry's correctness rate when it
+    has been measured on enough answers (at least
+    MIN_SAMPLES_PER_TYPE checked); otherwise the entry's success
+    rate stands in for it, so a type with no correctness data
+    yet still competes on success and routing does not break
+    while cards accumulate probe data. A type measured and found
+    wrong therefore loses to one merely unmeasured, and a type
+    measured and found right beats one that only answers.
+    Returns None when no card qualifies: the caller falls back
+    to its old default, so behaviour is unchanged until cards
+    are trusted.
     """
     best = None
     best_key = None
@@ -434,13 +491,27 @@ def colony_type_pick(task_type: str) -> Optional[str]:
         if entry is None:
             continue
         # Compare UNROUNDED ratios from the raw counts, not the
-        # rounded stored values: two cards whose success rates
-        # round to the same number (0.834 vs 0.836 -> 0.83) must
-        # not tie and fall back to sorted card order.
+        # rounded stored values: two cards whose rates round to
+        # the same number (0.834 vs 0.836 -> 0.83) must not tie
+        # and fall back to sorted card order.
         samples = entry["samples"]
         if not samples:
             continue
+        checked = entry.get("checked", 0)
+        if checked >= MIN_SAMPLES_PER_TYPE:
+            quality = entry.get("correct", 0) / checked
+            if quality == 0.0:
+                # Measured and found always wrong: ranks below
+                # every type with a real rate, including an
+                # unmeasured one, so a known-wrong type never
+                # beats a merely unmeasured one on a tie.
+                quality = -1.0
+        else:
+            # Not enough correctness data yet: the success rate
+            # stands in, so the type still competes.
+            quality = entry["successes"] / samples
         key = (
+            quality,
             entry["successes"] / samples,
             -(entry["total_seconds"] / samples),
         )
