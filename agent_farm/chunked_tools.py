@@ -10,7 +10,7 @@ from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .mcp_app import mcp
-from .state import MODEL_TIERS, colonies, stats
+from .state import MODEL_TIERS, colonies, stats, prompt_for_model
 from .colony import spawn_colony_internal
 from .ollama import query_ollama, sync_query_ollama, sync_query_raw, synthesize_swarm_results
 from .action_log import log_action
@@ -107,7 +107,11 @@ RULES:
 
 Write the section content now:"""
 
-    response = query_ollama_sync(MODEL_TIERS["worker"], prompt)
+    # Review-tuned models return a verdict ("CLEAN") for a bare
+    # prompt; give them the do-the-task instruction.
+    response = query_ollama_sync(
+        MODEL_TIERS["worker"], prompt_for_model(MODEL_TIERS["worker"], prompt)
+    )
     
     # Clean up response
     content = response.strip()
@@ -262,7 +266,11 @@ RULES:
 - Do NOT include other functions
 
 Write the function now:"""
-    response = query_ollama_sync(MODEL_TIERS["worker"], prompt)
+    # Review-tuned models return a verdict ("CLEAN") for a bare
+    # prompt; give them the do-the-task instruction.
+    response = query_ollama_sync(
+        MODEL_TIERS["worker"], prompt_for_model(MODEL_TIERS["worker"], prompt)
+    )
     import re
     content = response.strip()
     content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
@@ -454,7 +462,11 @@ FOCUS ON: {persp['focus']}
 
 Provide a focused analysis (3-5 key points) from this perspective only.
 Be specific and actionable."""
-    response = query_ollama_sync(MODEL_TIERS["learner"], prompt)
+    # Review-tuned models return a verdict ("CLEAN") for a bare
+    # prompt; give them the do-the-task instruction.
+    response = query_ollama_sync(
+        MODEL_TIERS["learner"], prompt_for_model(MODEL_TIERS["learner"], prompt)
+    )
     import re
     content = response.strip()
     content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
