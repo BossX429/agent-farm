@@ -1200,7 +1200,11 @@ def test_router_all_wrong_role_loses(monkeypatch, tmp_path):
     # A role measured on 5 analyze answers and wrong on all of
     # them must lose to a role with no correctness data, even
     # when the all-wrong role answers successfully and the
-    # unmeasured one does not.
+    # unmeasured one does not. Memory's analyze runs are failures
+    # (success 0.0), so its fallback quality is 0.0 and it cannot
+    # win on success alone: only the all-wrong rule (worker
+    # quality -1.0) makes memory win. Without the rule the pick
+    # ties on quality 0.0 and the worker wins on success.
     from agent_farm.colony import get_best_bug_for_task
 
     _profile_dir(monkeypatch, tmp_path)
@@ -1211,7 +1215,10 @@ def test_router_all_wrong_role_loses(monkeypatch, tmp_path):
             record_profile_run(
                 "worker", "qwen2.5-coder:7b-v8-review", task_type, 0.1, True, None, correct
             )
-            record_profile_run("memory", "qwen3:4b", task_type, 1.0, True, None, None)
+            success = task_type != "analyze"
+            record_profile_run(
+                "memory", "qwen3:4b", task_type, 1.0, success, None, None
+            )
     # Memory has no correctness data for analyze; worker is
     # measured all-wrong. Memory must win.
     picked = get_best_bug_for_task({"prompt": "analyze code"}, colony)
