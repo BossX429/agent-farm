@@ -412,40 +412,90 @@ def test_prompt_for_model_instructs_review_model():
 def test_colony_sends_instruction_to_worker(monkeypatch):
     # A worker bug (review-tuned coder model) must receive the
     # do-the-task instruction, or it answers "CLEAN" instead of
-    # doing the work. A scout bug (qwen3:4b) must not.
+    # doing the work. A scout bug (qwen3:4b) must NOT: the
+    # instruction is reserved for the review-tuned model.
     seen = {}
 
     def _capture(model, prompt, **kwargs):
-        seen[model] = prompt
+        seen.setdefault(model, []).append(prompt)
         return "def add(a, b):\n    return a + b"
 
     monkeypatch.setattr(colony_module, "sync_query_ollama", _capture)
     colony = spawn_colony_internal("standard")
+    # Two tasks: one routes to a worker (code), one to a scout
+    # (list), so both models are called and both are checked.
     execute_parallel_swarm(
-        [{"prompt": "write a python function that adds two numbers"}], colony
+        [
+            {"prompt": "write a python function that adds two numbers"},
+            {"prompt": "list the files in the folder"},
+        ],
+        colony,
     )
-    worker_prompt = seen["qwen2.5-coder:7b-v8-review"]
-    assert worker_prompt.startswith("Do the task below")
-    assert "write a python function" in worker_prompt
+    worker_prompts = seen["qwen2.5-coder:7b-v8-review"]
+    assert worker_prompts, "worker was never called"
+    for prompt in worker_prompts:
+        assert prompt.startswith("Do the task below")
+        assert "write a python function" in prompt
+    scout_prompts = seen.get("qwen3:4b", [])
+    assert scout_prompts, "scout was never called"
+    for prompt in scout_prompts:
+        assert "Do the task below" not in prompt
 
 
 def test_probe_sends_instruction_to_worker(monkeypatch):
     # A probe for a worker bug must also carry the instruction,
     # or the probe records a success for a "CLEAN" verdict and
-    # the card is inflated.
+    # the card is inflated. Every captured prompt is checked (not
+    # just the last one per model): it must carry the instruction
+    # AND the probe task and context, or a probe that sends only
+    # the instruction would pass while recording garbage. A scout
+    # probe (qwen3:4b) must NOT get the instruction.
     import agent_farm.probes as probes_module
 
     seen = {}
 
     def _capture(model, prompt, **kwargs):
-        seen[model] = prompt
+        seen.setdefault(model, []).append(prompt)
         return "def add(a, b):\n    return a + b"
 
     monkeypatch.setattr(probes_module, "sync_query_ollama", _capture)
     colony = spawn_colony_internal("standard")
     probes_module.run_probes(colony)
-    worker_prompt = seen["qwen2.5-coder:7b-v8-review"]
-    assert worker_prompt.startswith("Do the task below")
+    worker_prompts = seen["qwen2.5-coder:7b-v8-review"]
+    assert worker_prompts, "worker was never probed"
+    for prompt in worker_prompts:
+        assert prompt.startswith("Do the task below")
+        assert "Task:" in prompt
+        assert "Context:" in prompt
+    scout_prompts = seen.get("qwen3:4b", [])
+    assert scout_prompts, "scout was never probed"
+    for prompt in scout_prompts:
+        assert "Do the task below" not in prompt
+        assert "Task:" in prompt
+
+
+def test_chunked_tools_send_instruction_to_worker(monkeypatch):
+    # A chunked section write uses the worker model directly
+    # (query_ollama_sync, no structured prompt), so it must also
+    # carry the do-the-task instruction or the section comes back
+    # as a "CLEAN" verdict.
+    import agent_farm.chunked_tools as chunked_tools_module
+    import agent_farm.agent as agent_module
+
+    seen = {}
+
+    def _capture(model, prompt, **kwargs):
+        seen.setdefault(model, []).append(prompt)
+        return "Section content here."
+
+    monkeypatch.setattr(agent_module, "query_ollama_sync", _capture)
+    chunked_tools_module.generate_section_content(
+        {"title": "Intro", "description": "An intro"}, "A doc", 1, 3
+    )
+    worker_prompts = seen["qwen2.5-coder:7b-v8-review"]
+    assert worker_prompts, "worker was never called"
+    for prompt in worker_prompts:
+        assert prompt.startswith("Do the task below")
 
 
 def test_synthesizer_is_the_30b_reasoning_model():

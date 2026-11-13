@@ -49,6 +49,16 @@ MODEL_TIERS = {
 # does not need it. The tool-swarm path does not need it: its
 # prompt builders already tell the model exactly what to do
 # (pick a tool, return JSON).
+#
+# The instruction names the forbidden output directly ("do not
+# say CLEAN or BUGGY") because softer wordings were tested live
+# and do not work: "never reply with only a single word" and
+# "a single word is not an answer; always explain" both still
+# return "CLEAN" for a code task. The prohibition does not block
+# review when review is the task: the analyze probe ("Name one
+# problem in the code") still returns "BUGGY" with this
+# instruction, because the model ignores the prohibition when
+# the task itself asks for a judgment.
 MODELS_NEEDING_TASK_INSTRUCTION = frozenset({"qwen2.5-coder:7b-v8-review"})
 TASK_INSTRUCTION = (
     "Do the task below. Write out the full answer. "
