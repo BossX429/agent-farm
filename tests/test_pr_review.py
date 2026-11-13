@@ -6,12 +6,22 @@ The live proof on the PC is where the real model is exercised.
 """
 
 from agent_farm.pr_review import (
+    cross_check_findings,
     parse_findings,
     parse_unified_diff,
     review_branch,
     review_diff,
     review_file_diff,
 )
+
+_FINDING = {
+    "severity": "HIGH",
+    "title": "Bad change",
+    "file": "agent_farm/profiles.py",
+    "line": 13,
+    "body": "Bad.",
+}
+
 
 _DIFF = """diff --git a/agent_farm/profiles.py b/agent_farm/profiles.py
 index 1111111..2222222 100644
@@ -212,6 +222,81 @@ def test_review_branch_uses_git_exe_env(monkeypatch, tmp_path):
     assert result["findings"] == []
     calls = record.read_text()
     assert "diff main...HEAD" in calls
+
+
+def test_cross_check_keeps_judge_confirmed_finding():
+    # The judge says YES: the finding is kept.
+    def _yes(model, prompt):
+        assert model == "gemma4:26b-a4b-qat"
+        return "VERDICT: YES\nReason: The code really does that."
+
+    kept, rejected = cross_check_findings(
+        [_FINDING], {"agent_farm/profiles.py": "x = 1\n"}, query_fn=_yes
+    )
+    assert kept == [_FINDING]
+    assert rejected == []
+
+
+def test_cross_check_drops_judge_rejected_finding():
+    # The judge says NO: the finding is dropped with the reason.
+    def _no(model, prompt):
+        return "VERDICT: NO\nReason: The code does not do that."
+
+    kept, rejected = cross_check_findings(
+        [_FINDING], {"agent_farm/profiles.py": "x = 1\n"}, query_fn=_no
+    )
+    assert kept == []
+    assert len(rejected) == 1
+    assert "cross-check judge said NO" in rejected[0][1]
+    assert "The code does not do that" in rejected[0][1]
+
+
+def test_cross_check_keeps_when_judge_does_not_answer():
+    # A judge that does not answer in the required format does
+    # not reject: the finding is kept.
+    def _unclear(model, prompt):
+        return "This looks bad, maybe."
+
+    kept, rejected = cross_check_findings(
+        [_FINDING], {"agent_farm/profiles.py": "x = 1\n"}, query_fn=_unclear
+    )
+    assert kept == [_FINDING]
+    assert rejected == []
+
+
+def test_cross_check_keeps_when_judge_fails():
+    # A judge that raises (model not pulled, Ollama down) does
+    # not silence the reviewer: the finding is kept.
+    def _boom(model, prompt):
+        raise RuntimeError("Ollama is down")
+
+    kept, rejected = cross_check_findings(
+        [_FINDING], {"agent_farm/profiles.py": "x = 1\n"}, query_fn=_boom
+    )
+    assert kept == [_FINDING]
+    assert rejected == []
+
+
+def test_review_diff_skips_cross_check_when_asked():
+    # cross_check=False means the judge is never called, even
+    # though the fake would answer. The finding is reported as
+    # the reviewer wrote it.
+    calls = []
+
+    def _fake(model, prompt):
+        calls.append(model)
+        return """[HIGH] Bad change
+File: agent_farm/profiles.py
+Line: 13
+Body: Bad.
+"""
+
+    result = review_diff(_DIFF, query_fn=_fake, cross_check=False)
+    # The fake returns one finding per file, and _DIFF has two
+    # files. Only the review calls happened (one per file); no
+    # judge call.
+    assert len(result["findings"]) == 2
+    assert calls == ["qwen3:30b-a3b-q3k", "qwen3:30b-a3b-q3k"]
 
 
 def test_review_diff_empty_returns_error():
