@@ -25,14 +25,24 @@ def strip_think_blocks(text: str) -> str:
     end of the string. A response with no block is returned
     unchanged.
     """
-    if not isinstance(text, str) or "<think>" not in text:
+    if not isinstance(text, str):
+        return text
+    if "<think>" not in text and "</think>" not in text:
         return text
     out = []
     rest = text
     while True:
         start = rest.find("<think>")
         if start == -1:
-            out.append(rest)
+            # No opening tag left. A dangling </think> means the
+            # text before it is reasoning (the model emitted the
+            # close without the open); drop everything up to and
+            # including it and keep what follows.
+            end = rest.find("</think>")
+            if end == -1:
+                out.append(rest)
+            else:
+                out.append(rest[end + len("</think>"):])
             break
         out.append(rest[:start])
         end = rest.find("</think>", start)

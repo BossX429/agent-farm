@@ -349,6 +349,11 @@ def test_strip_think_blocks_removes_reasoning():
     assert strip_think_blocks(
         "<think>one</think>keep<think>two</think> this"
     ) == "keep this"
+    # A dangling </think> (reasoning text with no opening tag)
+    # drops everything up to and including the close tag.
+    assert strip_think_blocks(
+        "Reasoning with no opening tag.</think>\n\nThe answer."
+    ) == "The answer."
 
 
 def test_synthesis_strips_think_block(monkeypatch):
