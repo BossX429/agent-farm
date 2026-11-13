@@ -54,12 +54,14 @@ _COLONY = _file_with(
         18: "        entry = card['per_task_type'][task_type]",
         19: "        if entry['checked'] >= 5:",
         20: "            quality = entry['correct'] / entry['checked']",
-        21: "        else:",
-        22: "            quality = entry['successes'] / entry['samples']",
-        23: "        if quality > best_quality:",
-        24: "            best = colony_type",
-        25: "            best_quality = quality",
-        26: "    return best",
+        21: "            if quality == 0.0:",
+        22: "                quality = -1.0",
+        23: "        else:",
+        24: "            quality = entry['successes'] / entry['samples']",
+        25: "        if quality > best_quality:",
+        26: "            best = colony_type",
+        27: "            best_quality = quality",
+        28: "    return best",
     }
 )
 _PROBES = _file_with(
@@ -84,22 +86,25 @@ _PROFILES = _file_with(
 )
 _TEST_COLONY = _file_with(
     {
-        130: "def test_pick_prefers_measured_correctness_over_unmeasured():",
-        131: '    # Heavy has been measured and is right for "write"',
-        132: "    # (correctness 1.0), but its success rate is lower than",
-        133: "    # fast's. Fast has no correctness data yet, so it competes",
-        134: "    # on success. A success-only picker picks fast; the",
-        135: "    # correctness picker must pick heavy.",
-        136: '    _trust_card("fast")',
-        137: '    _trust_card("heavy")',
-        138: "    for _ in range(4):",
-        139: '        assert record_colony_run("fast", "write", 1.0, True)',
-        140: '    assert record_colony_run("fast", "write", 1.0, False, "error")',
-        141: "    for _ in range(5):",
-        142: '        assert record_colony_run("heavy", "write", 1.0, True, None, True)',
-        143: "    for _ in range(5):",
-        144: '        assert record_colony_run("heavy", "write", 1.0, False, "error")',
-        145: '    assert colony_type_pick("write") == "heavy"',
+        # Line numbers match the real file at the PR #24 head, so
+        # a finding citing line 147 points at a for loop, as the
+        # synthesizer's v3 finding did.
+        136: "def test_pick_prefers_measured_correctness_over_unmeasured():",
+        137: '    # Heavy has been measured and is right for "write"',
+        138: "    # (correctness 1.0), but its success rate is lower than",
+        139: "    # fast's. Fast has no correctness data yet, so it competes",
+        140: "    # on success. A success-only picker picks fast; the",
+        141: "    # correctness picker must pick heavy.",
+        142: '    _trust_card("fast")',
+        143: '    _trust_card("heavy")',
+        144: "    for _ in range(4):",
+        145: '        assert record_colony_run("fast", "write", 1.0, True)',
+        146: '    assert record_colony_run("fast", "write", 1.0, False, "error")',
+        147: "    for _ in range(MIN_SAMPLES_PER_TYPE):",
+        148: '        assert record_colony_run("heavy", "write", 1.0, True, None, True)',
+        149: "    for _ in range(MIN_SAMPLES_PER_TYPE):",
+        150: '        assert record_colony_run("heavy", "write", 1.0, False, "error")',
+        151: '    assert colony_type_pick("write") == "heavy"',
     }
 )
 _TEST_PROFILER = _file_with(
@@ -152,7 +157,7 @@ _FP_KEY_ERROR = _finding(
     "HIGH",
     "Test assumes key exists without checking",
     "tests/test_colony_profiles.py",
-    138,
+    144,
     "The test assumes `normalized[\"per_task_type\"][\"write\"]` "
     "exists, but the test data has `per_task_type` as an empty "
     "dict. If the code doesn't populate `per_task_type` with a "
@@ -196,7 +201,7 @@ _REAL_PICK_IGNORED = _finding(
     "MEDIUM",
     "Correctness ranking can be ignored",
     "tests/test_colony_profiles.py",
-    145,
+    151,
     "The pick test records runs with equal success and speed, so "
     "a picker that ignores `correctness` still passes. Make fast "
     "faster and higher-success so only a correctness-aware "
@@ -228,6 +233,79 @@ def test_verify_keeps_all_three_real_sourcery_findings():
         "Wrong answers can outrank unmeasured types",
         "Correctness ranking can be ignored",
     ]
+
+
+# The synthesizer's v3 false positives on PR #24. The quote
+# check must reject the hallucinated assertion; the
+# floating-point finding quotes real code, so verification keeps
+# it and the cross-check is the layer that must catch it.
+_V3_HALLUCINATED_ASSERT = _finding(
+    "HIGH",
+    "Test asserts wrong behavior for correctness ranking",
+    "tests/test_colony_profiles.py",
+    147,
+    "The test describes a scenario where a colony type with all "
+    "wrong answers (correctness 0, success rate 1.0) should lose "
+    "to a colony type with no correctness data (success rate "
+    "0.0), but the test incorrectly asserts "
+    "`assert colony_type_pick(\"write\") == \"fast\"`. In "
+    "reality, the all-wrong type (\"heavy\") should lose.",
+)
+_V3_FLOATING_POINT = _finding(
+    "MEDIUM",
+    "Floating-point comparison in correctness ranking",
+    "agent_farm/colony_profiles.py",
+    21,
+    "The code uses `if quality == 0.0` to determine if a type "
+    "was measured and found wrong, but this is a floating-point "
+    "comparison that might not work as expected due to "
+    "floating-point precision. For example, when `correct = 1` "
+    "and `checked = 1000000`, `quality = 1e-6` which is not "
+    "equal to `0.0`.",
+)
+
+
+def test_quote_check_rejects_hallucinated_assertion():
+    # The test asserts == "heavy", not == "fast". The finding
+    # quotes an assertion that is nowhere in the file, so the
+    # quote check rejects it.
+    kept, rejected = verify_findings([_V3_HALLUCINATED_ASSERT], _CONTENTS)
+    assert kept == []
+    assert len(rejected) == 1
+    assert "quoted code not found" in rejected[0][1]
+    assert "fast" in rejected[0][1]
+
+
+def test_quote_check_keeps_finding_that_quotes_real_code():
+    # The floating-point finding quotes `if quality == 0.0`,
+    # which really is in the file. Verification keeps it: the
+    # error is in its reasoning (0/x is exactly 0.0), not in
+    # what it quotes, and that is the cross-check's job.
+    kept, rejected = verify_findings([_V3_FLOATING_POINT], _CONTENTS)
+    assert kept == [_V3_FLOATING_POINT]
+    assert rejected == []
+
+
+def test_quote_check_keeps_quote_from_removed_code():
+    # A finding may quote a line the diff removed. The quote
+    # check searches the diff too, so a quote that lives only
+    # in the diff is kept.
+    finding = _finding(
+        "MEDIUM",
+        "Removed guard",
+        "agent_farm/probes.py",
+        4,
+        "The diff removes `if success:` before the call, so a "
+        "failed run now records.",
+    )
+    diff_texts = {
+        "agent_farm/probes.py": "diff --git a/agent_farm/probes.py\n"
+        "-    if success:\n"
+        '+    record_colony_run("heavy", "write", 1.0, True)\n'
+    }
+    kept, rejected = verify_findings([finding], _CONTENTS, diff_texts)
+    assert kept == [finding]
+    assert rejected == []
 
 
 def test_verify_keeps_finding_with_no_file_content():

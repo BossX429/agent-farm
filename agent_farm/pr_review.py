@@ -123,6 +123,43 @@ FULL FILE (the changed file after this diff, so you can see what the diff does n
 MAX_DIFF_CHARS = 60000
 MAX_FILE_CHARS = 40000
 MAX_FILES = 20
+# The model that judges findings. It must be a different family
+# from the reviewer (the synthesizer, qwen3:30b), so its mistakes
+# are independent: two models from the same family share the
+# same blind spots. gemma4:26b is on the PC and fits as a single
+# model, the same way the synthesizer runs.
+JUDGE_MODEL = "gemma4:26b-a4b-qat"
+JUDGE_EXCERPT_LINES = 20
+
+JUDGE_PROMPT = """You are a skeptical second reviewer. A first reviewer made one finding about the code below. Your job is to check whether the finding is CORRECT, not to find new issues.
+
+FINDING:
+[{severity}] {title}
+File: {file}
+Line: {line}
+Body: {body}
+
+CODE AROUND THE CITED LINE:
+```
+{excerpt}
+```
+
+Read the code carefully and decide:
+- Is the code the finding describes actually there, and does it do what the finding says?
+- Is the finding's reasoning right? A finding that cites real code but reasons wrongly about it is WRONG.
+- If the finding quotes code, does the quoted code match the code above?
+
+Answer in exactly this format, nothing else before it:
+VERDICT: YES
+Reason: one sentence.
+
+or
+
+VERDICT: NO
+Reason: one sentence.
+
+YES means the finding is correct and worth reporting. NO means it is wrong, hallucinated, or based on a misunderstanding, and it must be dropped. When in doubt, say NO: a dropped finding costs nothing, a reported false finding wastes a human's time.
+"""
 
 
 def parse_unified_diff(diff_text: str) -> List[Dict[str, Any]]:
@@ -261,12 +298,88 @@ def review_file_diff(
     return parse_findings(response, default_path=path)
 
 
+def _excerpt(lines, line_no, radius=JUDGE_EXCERPT_LINES):
+    """The lines around a cited line, with line numbers, so the
+    judge sees the code the finding is about."""
+    start = max(0, line_no - 1 - radius)
+    end = min(len(lines), line_no + radius)
+    return "\n".join(
+        f"{i + 1}: {lines[i]}" for i in range(start, end)
+    )
+
+
+def _parse_judge_verdict(text):
+    """The judge's verdict: True for YES, False for NO, None
+    when the judge did not answer in the required format. A
+    judge that cannot answer clearly does not reject."""
+    if not text:
+        return None
+    upper = text.upper()
+    if "VERDICT: YES" in upper:
+        return True
+    if "VERDICT: NO" in upper:
+        return False
+    return None
+
+
+def cross_check_findings(
+    findings,
+    file_contents,
+    query_fn=sync_query_raw,
+    judge_model=JUDGE_MODEL,
+):
+    """Ask a second, different model to judge each finding. Only
+    findings the judge confirms are kept; the rest are dropped
+    and reported with the judge's reasoning. A judge that fails,
+    or that does not answer in the required format, does not
+    reject: the finding is kept, because a broken judge must not
+    silence the reviewer. Returns (kept, rejected)."""
+    kept = []
+    rejected = []
+    contents = file_contents or {}
+    for finding in findings:
+        content = contents.get(finding.get("file", ""), "")
+        lines = content.splitlines() if content else []
+        line_no = finding.get("line")
+        excerpt = ""
+        if isinstance(line_no, int) and lines:
+            excerpt = _excerpt(lines, line_no)
+        prompt = JUDGE_PROMPT.format(
+            severity=finding.get("severity", ""),
+            title=finding.get("title", ""),
+            file=finding.get("file", ""),
+            line=line_no,
+            body=finding.get("body", ""),
+            excerpt=excerpt or "(no file content available)",
+        )
+        try:
+            answer = query_fn(judge_model, prompt)
+        except Exception:
+            kept.append(finding)
+            continue
+        verdict = _parse_judge_verdict(answer)
+        if verdict is False:
+            reason = answer.strip().splitlines()
+            why = ""
+            for part in reason:
+                if part.strip().lower().startswith("reason:"):
+                    why = part.strip()[len("Reason:"):].strip()
+                    break
+            rejected.append(
+                (finding, f"cross-check judge said NO: {why or answer.strip()[:200]}")
+            )
+        else:
+            kept.append(finding)
+    return kept, rejected
+
+
 def review_diff(
     diff_text: str,
     query_fn: Callable[[str, str], str] = sync_query_raw,
     model: str = REVIEW_MODEL,
     max_files: int = MAX_FILES,
     file_contents: Optional[Dict[str, str]] = None,
+    cross_check: bool = True,
 ) -> Dict[str, Any]:
     """Review a whole unified diff. Returns files reviewed and findings.
 
@@ -298,8 +411,20 @@ def review_diff(
     # Verify every finding against the real files before
     # reporting it. A finding the checks prove wrong is dropped;
     # the drop is reported, not hidden, so a model that
-    # hallucinates is visible in the result.
-    kept, rejected = verify_findings(findings, contents)
+    # hallucinates is visible in the result. The quote check also
+    # searches each file's diff, because a finding may quote a
+    # line the diff removed.
+    diff_texts = {
+        entry["path"]: "\n".join(entry["diff"]) for entry in files[:max_files]
+    }
+    kept, rejected = verify_findings(findings, contents, diff_texts)
+    # A second, different model judges what survived
+    # verification. Only findings both models agree are real get
+    # reported. Skipped when cross_check is False, or when the
+    # judge cannot be reached (then findings are kept).
+    if cross_check:
+        kept, cross_rejected = cross_check_findings(kept, contents, query_fn)
+        rejected.extend(cross_rejected)
     return {
         "files": reviewed,
         "findings": kept,
@@ -317,6 +442,7 @@ def review_branch(
     head: str = "HEAD",
     query_fn: Callable[[str, str], str] = sync_query_raw,
     model: str = REVIEW_MODEL,
+    cross_check: bool = True,
 ) -> Dict[str, Any]:
     """Review the diff between two refs in a local git repo.
 
@@ -354,4 +480,7 @@ def review_branch(
         )
         if show.returncode == 0:
             contents[entry["path"]] = show.stdout
-    return review_diff(proc.stdout, query_fn, model, file_contents=contents)
+    return review_diff(
+        proc.stdout, query_fn, model, file_contents=contents,
+        cross_check=cross_check,
+    )
