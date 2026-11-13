@@ -1172,6 +1172,59 @@ def test_router_prefers_trusted_card(monkeypatch, tmp_path):
     assert picked.id == workers[1].id
 
 
+def test_router_prefers_higher_correctness(monkeypatch, tmp_path):
+    # An "analyze" prompt must go to the role that is actually
+    # right at analyze, not the one that merely answers. The
+    # worker (coder) is wrong on every checked analyze answer
+    # (correctness 0.0); memory (qwen3:4b) is right on every one
+    # (correctness 1.0). The worker is also faster, so a picker
+    # that ignores correctness picks the worker on the
+    # success-and-speed tie-breakers. The correctness picker
+    # must pick memory.
+    from agent_farm.colony import get_best_bug_for_task
+
+    _profile_dir(monkeypatch, tmp_path)
+    colony = spawn_colony_internal("standard")
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            correct = task_type != "analyze"
+            record_profile_run(
+                "worker", "qwen2.5-coder:7b-v8-review", task_type, 0.1, True, None, correct
+            )
+            record_profile_run("memory", "qwen3:4b", task_type, 1.0, True, None, True)
+    picked = get_best_bug_for_task({"prompt": "analyze code"}, colony)
+    assert picked.role == "memory"
+
+
+def test_router_all_wrong_role_loses(monkeypatch, tmp_path):
+    # A role measured on 5 analyze answers and wrong on all of
+    # them must lose to a role with no correctness data, even
+    # when the all-wrong role answers successfully and the
+    # unmeasured one does not. Memory's analyze runs are failures
+    # (success 0.0), so its fallback quality is 0.0 and it cannot
+    # win on success alone: only the all-wrong rule (worker
+    # quality -1.0) makes memory win. Without the rule the pick
+    # ties on quality 0.0 and the worker wins on success.
+    from agent_farm.colony import get_best_bug_for_task
+
+    _profile_dir(monkeypatch, tmp_path)
+    colony = spawn_colony_internal("standard")
+    for task_type in PROBE_TASK_TYPES:
+        for _ in range(MIN_SAMPLES_PER_TYPE):
+            correct = task_type != "analyze"
+            record_profile_run(
+                "worker", "qwen2.5-coder:7b-v8-review", task_type, 0.1, True, None, correct
+            )
+            success = task_type != "analyze"
+            record_profile_run(
+                "memory", "qwen3:4b", task_type, 1.0, success, None, None
+            )
+    # Memory has no correctness data for analyze; worker is
+    # measured all-wrong. Memory must win.
+    picked = get_best_bug_for_task({"prompt": "analyze code"}, colony)
+    assert picked.role == "memory"
+
+
 def test_router_search_goes_to_memory(monkeypatch, tmp_path):
     # The shared taxonomy: a "search" prompt routes to memory,
     # the same bucket the profiler records it in.
