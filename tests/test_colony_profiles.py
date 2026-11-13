@@ -119,6 +119,80 @@ def test_pick_prefers_higher_success_rate():
     assert colony_type_pick("write") == "heavy"
 
 
+def test_pick_prefers_higher_correctness():
+    # Both types answer everything for "write" (success 1.0),
+    # but heavy is right and fast is wrong. The pick must choose
+    # heavy: correctness beats a success rate that hides wrong
+    # answers.
+    _trust_card("fast")
+    _trust_card("heavy")
+    for _ in range(MIN_SAMPLES_PER_TYPE):
+        assert record_colony_run("heavy", "write", 1.0, True, None, True)
+        assert record_colony_run("fast", "write", 1.0, True, None, False)
+    assert colony_type_pick("write") == "heavy"
+
+
+def test_pick_prefers_measured_correctness_over_unmeasured():
+    # Heavy has been measured and is right for "write"
+    # (correctness 1.0). Fast has a lower success rate and no
+    # correctness data yet, so it competes on success. Heavy
+    # wins on its measured correctness.
+    _trust_card("fast")
+    _trust_card("heavy")
+    assert record_colony_run("fast", "write", 1.0, False, "error")
+    for _ in range(MIN_SAMPLES_PER_TYPE):
+        assert record_colony_run("heavy", "write", 1.0, True, None, True)
+    assert colony_type_pick("write") == "heavy"
+
+
+def test_probe_records_correctness_on_colony_card(monkeypatch):
+    # A probe run records correctness on the colony type's card
+    # as well as the role cards, so the pick has correctness to
+    # rank on.
+    import agent_farm.probes as probes_module
+
+    def _right(model, prompt, **kwargs):
+        return "def add(a, b):\n    return a + b"
+
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _right)
+    colony = spawn_colony_internal("standard")
+    probes_module.run_probes(colony)
+    card = get_colony_profile("standard")
+    write_entry = card["per_task_type"]["write"]
+    assert write_entry["checked"] >= 1
+    assert write_entry["correct"] == write_entry["checked"]
+    assert write_entry["correctness_rate"] == 1.0
+    assert card["correctness_rate"] > 0.0
+
+
+def test_old_colony_card_without_correctness_loads():
+    # A colony card written before correctness was measured has
+    # no checked / correct fields; loading it must fill them
+    # with zero instead of breaking.
+    from agent_farm.colony_profiles import _normalize_colony_card
+
+    old = {
+        "colony_type": "heavy",
+        "machine": "him",
+        "samples": 10,
+        "successes": 9,
+        "failures": 1,
+        "success_rate": 0.9,
+        "total_seconds": 50.0,
+        "avg_seconds": 5.0,
+        "per_task_type": {},
+        "failure_modes": {},
+        "trusted": False,
+        "stale": False,
+    }
+    normalized = _normalize_colony_card(old, "heavy")
+    assert normalized is not None
+    assert normalized["checked"] == 0
+    assert normalized["correct"] == 0
+    assert normalized["correctness_rate"] == 0.0
+    assert normalized["per_task_type"]["write"]["checked"] == 0
+
+
 def test_pick_prefers_faster_on_tie():
     _trust_card("fast")
     _trust_card("standard")

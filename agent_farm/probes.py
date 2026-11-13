@@ -276,6 +276,7 @@ def run_probes(colony: Colony) -> List[Dict[str, Any]]:
                 elapsed,
                 success,
                 failure_kind,
+                correct,
             )
             results.append({
                 "bug_id": bug.id,
