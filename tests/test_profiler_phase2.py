@@ -394,6 +394,60 @@ def test_synthesis_strips_think_block(monkeypatch):
     assert "Local AI keeps data private" in result
 
 
+def test_prompt_for_model_instructs_review_model():
+    from agent_farm.state import prompt_for_model
+
+    # The review-tuned coder gets the do-the-task instruction.
+    instructed = prompt_for_model(
+        "qwen2.5-coder:7b-v8-review", "write a function"
+    )
+    assert instructed.startswith("Do the task below")
+    assert "write a function" in instructed
+    assert "do not say CLEAN or BUGGY" in instructed
+    # Any other model gets its prompt back unchanged.
+    assert prompt_for_model("qwen3:4b", "write a function") == "write a function"
+    assert prompt_for_model("qwen2.5:14b", "write a function") == "write a function"
+
+
+def test_colony_sends_instruction_to_worker(monkeypatch):
+    # A worker bug (review-tuned coder model) must receive the
+    # do-the-task instruction, or it answers "CLEAN" instead of
+    # doing the work. A scout bug (qwen3:4b) must not.
+    seen = {}
+
+    def _capture(model, prompt, **kwargs):
+        seen[model] = prompt
+        return "def add(a, b):\n    return a + b"
+
+    monkeypatch.setattr(colony_module, "sync_query_ollama", _capture)
+    colony = spawn_colony_internal("standard")
+    execute_parallel_swarm(
+        [{"prompt": "write a python function that adds two numbers"}], colony
+    )
+    worker_prompt = seen["qwen2.5-coder:7b-v8-review"]
+    assert worker_prompt.startswith("Do the task below")
+    assert "write a python function" in worker_prompt
+
+
+def test_probe_sends_instruction_to_worker(monkeypatch):
+    # A probe for a worker bug must also carry the instruction,
+    # or the probe records a success for a "CLEAN" verdict and
+    # the card is inflated.
+    import agent_farm.probes as probes_module
+
+    seen = {}
+
+    def _capture(model, prompt, **kwargs):
+        seen[model] = prompt
+        return "def add(a, b):\n    return a + b"
+
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _capture)
+    colony = spawn_colony_internal("standard")
+    probes_module.run_probes(colony)
+    worker_prompt = seen["qwen2.5-coder:7b-v8-review"]
+    assert worker_prompt.startswith("Do the task below")
+
+
 def test_synthesizer_is_the_30b_reasoning_model():
     # The synthesizer is the heavy-reasoning role: it runs AFTER
     # colony work completes, so Ollama evicts the finished colony

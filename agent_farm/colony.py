@@ -18,6 +18,7 @@ from .state import (
     NanoArmor,
     colonies,
     stats,
+    prompt_for_model,
 )
 from .ollama import sync_query_ollama
 from .metrics import record_bug_run
@@ -161,6 +162,9 @@ def execute_parallel_swarm(tasks: List[Dict[str, str]], colony: Colony) -> List[
             prompt = task.get("prompt", "")
             context = task.get("context", "")
             full_prompt = f"Context: {context}\n\nTask: {prompt}" if context else prompt
+            # Review-tuned models return a verdict ("CLEAN") for a
+            # bare task prompt; give them the do-the-task instruction.
+            full_prompt = prompt_for_model(bug.model, full_prompt)
             future = executor.submit(_run_bug_query, bug, full_prompt)
             futures[future] = (bug, task, profiled, time.monotonic())
 

@@ -37,6 +37,36 @@ MODEL_TIERS = {
     "synthesizer": "qwen3:30b-a3b-q3k",  # 14.7GB - synthesis/summarization (accuracy over speed)
 }
 
+# Models that are review-tuned: given a bare task prompt they
+# return a review verdict ("CLEAN" / "BUGGY") instead of doing
+# the work. qwen2.5-coder:7b-v8-review does this reproducibly:
+# the bare prompt "write a python function that adds two numbers"
+# returns "CLEAN" every time, while "Return only the code" makes
+# it write proper code. These models get an explicit do-the-task
+# instruction prepended to the prompt. The instruction is keyed
+# by MODEL, not by role: it follows the model wherever it is
+# used, and stops applying if a role's model changes to one that
+# does not need it. The tool-swarm path does not need it: its
+# prompt builders already tell the model exactly what to do
+# (pick a tool, return JSON).
+MODELS_NEEDING_TASK_INSTRUCTION = frozenset({"qwen2.5-coder:7b-v8-review"})
+TASK_INSTRUCTION = (
+    "Do the task below. Write out the full answer. "
+    "Do not give a one-word verdict, do not review anything, "
+    "do not say CLEAN or BUGGY."
+)
+
+
+def prompt_for_model(model: str, prompt: str) -> str:
+    """Prepend the do-the-task instruction for review-tuned models.
+
+    A model that does not need the instruction gets the prompt
+    back unchanged, so this is safe to call on every prompt.
+    """
+    if model in MODELS_NEEDING_TASK_INSTRUCTION:
+        return f"{TASK_INSTRUCTION}\n\n{prompt}"
+    return prompt
+
 # Grounding instruction to prevent hallucination
 GROUNDING = "/nothink You are a specialized AI bug. Answer ONLY from given context. If unsure, say 'UNCERTAIN'. Be concise."
 

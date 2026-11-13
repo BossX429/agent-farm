@@ -31,7 +31,7 @@ from .ollama import sync_query_ollama
 from .colony_profiles import record_colony_run
 from .profiles import classify_result, record_profile_run
 from .reliability import MAX_MODEL_CONCURRENCY, MODEL_SEMAPHORE
-from .state import Colony
+from .state import Colony, prompt_for_model
 
 # One job per task type. Each job's context is the whole job:
 # the prompt asks for something answerable from the context
@@ -87,6 +87,11 @@ def _run_one_probe(bug: Any, job: Dict[str, str]):
     only as a safety net for a call that does raise.
     """
     full_prompt = f"Context: {job['context']}\n\nTask: {job['prompt']}"
+    # Review-tuned models return a verdict ("CLEAN") for a bare
+    # probe prompt; give them the do-the-task instruction, or the
+    # probe records a success for garbage and the card is inflated.
+    full_prompt = prompt_for_model(bug.model, full_prompt)
+
     try:
         with MODEL_SEMAPHORE:
             started = time.monotonic()
