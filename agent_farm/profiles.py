@@ -648,12 +648,20 @@ def profile_pick(task_type: str, bugs: List[Any]) -> Optional[Any]:
     A bug is picked this way only when its role + model has a
     trusted, non-stale card for this machine and that card's
     entry for the task type is trusted too. Among several, the
-    highest success rate wins, then the fastest. Anything less
-    than that falls back to keyword routing: an untrusted card
-    is a hint, not evidence. Cards are read from disk on each
-    call; they are small JSON files and the OS caches them.
-    Both routers (colony and agent) use this one function, so
-    a profile pick means the same thing on either path.
+    highest correctness wins, then the highest success rate,
+    then the fastest. Correctness is the entry's correctness
+    rate when it has been measured on enough answers (at least
+    MIN_SAMPLES_PER_TYPE checked); otherwise the entry's
+    success rate stands in for it, so a role with no
+    correctness data yet still competes. A role measured and
+    found always wrong ranks below every role with a real rate,
+    so a known-wrong role never beats a merely unmeasured one.
+    Anything less than that falls back to keyword routing: an
+    untrusted card is a hint, not evidence. Cards are read from
+    disk on each call; they are small JSON files and the OS
+    caches them. Both routers (colony and agent) use this one
+    function, so a profile pick means the same thing on either
+    path.
     """
     best = None
     best_key = None
@@ -665,7 +673,25 @@ def profile_pick(task_type: str, bugs: List[Any]) -> Optional[Any]:
             continue
         for bug in bugs:
             if bug.role == card["role"] and bug.model == card["model"]:
-                key = (entry["success_rate"], -entry["avg_seconds"])
+                # Compare UNROUNDED ratios from the raw counts,
+                # not the rounded stored values: two cards whose
+                # rates round to the same number must not tie and
+                # fall back to card order.
+                samples = entry.get("samples", 0)
+                if not samples:
+                    continue
+                checked = entry.get("checked", 0)
+                if checked >= MIN_SAMPLES_PER_TYPE:
+                    quality = entry.get("correct", 0) / checked
+                    if quality == 0.0:
+                        quality = -1.0
+                else:
+                    quality = entry.get("successes", 0) / samples
+                key = (
+                    quality,
+                    entry.get("successes", 0) / samples,
+                    -(entry.get("total_seconds", 0.0) / samples),
+                )
                 if best_key is None or key > best_key:
                     best_key = key
                     best = bug
