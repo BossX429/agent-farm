@@ -173,10 +173,10 @@ planner does not stall the async event loop.
 | Role | Model | VRAM | Purpose |
 |------|-------|------|---------|
 | Scout | qwen3:4b | 2.5GB | Reconnaissance |
-| Worker | qwen2.5-coder:7b-v8-review | 8.1GB | Task execution (code-tuned) |
+| Worker | qwen2.5-coder:7b | 4.7GB | Task execution (code-tuned) |
 | Memory | qwen3:4b | 2.5GB | Context retention |
 | Guardian | qwen3:4b | 2.5GB | System monitoring |
-| Learner | qwen2.5-coder:7b-v8-review | 8.1GB | Pattern acquisition (code-tuned) |
+| Learner | qwen2.5-coder:7b | 4.7GB | Pattern acquisition (code-tuned) |
 | **Synthesizer** | **qwen3:30b-a3b-q3k** | **14.7GB** | **Result synthesis** |
 
 > **Prerequisite:** pull the synthesizer model before upgrading, or

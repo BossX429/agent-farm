@@ -30,10 +30,10 @@ OLLAMA_URL = "http://localhost:11434"
 # noise between identical workers.
 MODEL_TIERS = {
     "scout": "qwen3:4b",       # 2.5GB - reconnaissance
-    "worker": "qwen2.5-coder:7b-v8-review",  # 8.1GB - task execution, code-tuned
+    "worker": "qwen2.5-coder:7b",  # 4.7GB - task execution, code-tuned
     "memory": "qwen3:4b",      # 2.5GB - was 8b but inconsistent tool format
     "guardian": "qwen3:4b",    # 2.5GB - validation, protection
-    "learner": "qwen2.5-coder:7b-v8-review",  # 8.1GB - code analysis, code-tuned
+    "learner": "qwen2.5-coder:7b",  # 4.7GB - code analysis, code-tuned
     "synthesizer": "qwen3:30b-a3b-q3k",  # 14.7GB - synthesis/summarization (accuracy over speed)
 }
 
@@ -59,7 +59,7 @@ MODEL_TIERS = {
 # problem in the code") still returns "BUGGY" with this
 # instruction, because the model ignores the prohibition when
 # the task itself asks for a judgment.
-MODELS_NEEDING_TASK_INSTRUCTION = frozenset({"qwen2.5-coder:7b-v8-review"})
+MODELS_NEEDING_TASK_INSTRUCTION = frozenset()
 TASK_INSTRUCTION = (
     "Do the task below. Write out the full answer. "
     "Do not give a one-word verdict, do not review anything, "
