@@ -121,27 +121,33 @@ def test_pick_prefers_higher_success_rate():
 
 def test_pick_prefers_higher_correctness():
     # Both types answer everything for "write" (success 1.0),
-    # but heavy is right and fast is wrong. The pick must choose
-    # heavy: correctness beats a success rate that hides wrong
-    # answers.
+    # but heavy is right and fast is wrong. Fast is also faster,
+    # so a picker that ignores correctness picks fast on the
+    # success-and-speed tie-breakers. The correctness picker
+    # must choose heavy.
     _trust_card("fast")
     _trust_card("heavy")
     for _ in range(MIN_SAMPLES_PER_TYPE):
         assert record_colony_run("heavy", "write", 1.0, True, None, True)
-        assert record_colony_run("fast", "write", 1.0, True, None, False)
+        assert record_colony_run("fast", "write", 0.5, True, None, False)
     assert colony_type_pick("write") == "heavy"
 
 
 def test_pick_prefers_measured_correctness_over_unmeasured():
     # Heavy has been measured and is right for "write"
-    # (correctness 1.0). Fast has a lower success rate and no
-    # correctness data yet, so it competes on success. Heavy
-    # wins on its measured correctness.
+    # (correctness 1.0), but its success rate is lower than
+    # fast's. Fast has no correctness data yet, so it competes
+    # on success. A success-only picker picks fast; the
+    # correctness picker must pick heavy.
     _trust_card("fast")
     _trust_card("heavy")
+    for _ in range(4):
+        assert record_colony_run("fast", "write", 1.0, True)
     assert record_colony_run("fast", "write", 1.0, False, "error")
     for _ in range(MIN_SAMPLES_PER_TYPE):
         assert record_colony_run("heavy", "write", 1.0, True, None, True)
+    for _ in range(MIN_SAMPLES_PER_TYPE):
+        assert record_colony_run("heavy", "write", 1.0, False, "error")
     assert colony_type_pick("write") == "heavy"
 
 
@@ -163,6 +169,30 @@ def test_probe_records_correctness_on_colony_card(monkeypatch):
     assert write_entry["correct"] == write_entry["checked"]
     assert write_entry["correctness_rate"] == 1.0
     assert card["correctness_rate"] > 0.0
+
+
+def test_failed_run_does_not_count_as_checked():
+    # A failed response must not count as a checked answer, even
+    # if a caller passes a correct value alongside success=False.
+    assert record_colony_run("heavy", "write", 1.0, False, "error", True)
+    card = get_colony_profile("heavy")
+    assert card["checked"] == 0
+    assert card["correct"] == 0
+    assert card["per_task_type"]["write"]["checked"] == 0
+
+
+def test_all_wrong_type_loses_to_unmeasured():
+    # A type measured on 5 answers and wrong on all of them must
+    # lose to a type with no correctness data, even when the
+    # all-wrong type answers successfully and the unmeasured one
+    # does not.
+    _trust_card("fast")
+    _trust_card("heavy")
+    for _ in range(MIN_SAMPLES_PER_TYPE):
+        assert record_colony_run("heavy", "write", 1.0, True, None, False)
+    for _ in range(MIN_SAMPLES_PER_TYPE):
+        assert record_colony_run("fast", "write", 1.0, False, "error")
+    assert colony_type_pick("write") == "fast"
 
 
 def test_old_colony_card_without_correctness_loads():

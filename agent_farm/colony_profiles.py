@@ -426,8 +426,11 @@ def record_colony_run(
                     modes[failure_kind] = modes.get(failure_kind, 0) + 1
             card["total_seconds"] += max(0.0, elapsed)
             # Correctness is recorded only when the answer was
-            # checked (a usable answer with a checker). A failed
-            # response is a failure, not a wrong answer.
+            # checked (a usable answer with a checker) AND the run
+            # succeeded. A failed response is a failure, not a
+            # checked answer, even if a caller passes a correct
+            # value alongside success=False.
+            correct = correct if success else None
             if correct is not None:
                 card["checked"] += 1
                 if correct:
@@ -497,6 +500,12 @@ def colony_type_pick(task_type: str) -> Optional[str]:
         checked = entry.get("checked", 0)
         if checked >= MIN_SAMPLES_PER_TYPE:
             quality = entry.get("correct", 0) / checked
+            if quality == 0.0:
+                # Measured and found always wrong: ranks below
+                # every type with a real rate, including an
+                # unmeasured one, so a known-wrong type never
+                # beats a merely unmeasured one on a tie.
+                quality = -1.0
         else:
             # Not enough correctness data yet: the success rate
             # stands in, so the type still competes.

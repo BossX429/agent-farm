@@ -711,9 +711,12 @@ def record_profile_run(
                 modes[failure_kind] = modes.get(failure_kind, 0) + 1
         card["total_seconds"] += max(0.0, elapsed)
         # Correctness is recorded only when the answer was
-        # checked (a usable answer with a checker). A failed
-        # response is a failure, not a wrong answer, and an
-        # uncheckable task type leaves correctness untouched.
+        # checked (a usable answer with a checker) AND the run
+        # succeeded. A failed response is a failure, not a
+        # checked answer, even if a caller passes a correct
+        # value alongside success=False. An uncheckable task
+        # type leaves correctness untouched.
+        correct = correct if success else None
         if correct is not None:
             card["checked"] += 1
             if correct:

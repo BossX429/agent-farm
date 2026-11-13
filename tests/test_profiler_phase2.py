@@ -606,6 +606,19 @@ def test_wrong_answer_does_not_count_as_correct(monkeypatch):
     assert write_entry["correctness_rate"] == 0.0
 
 
+def test_failed_run_does_not_count_as_checked():
+    # A failed response must not count as a checked answer on a
+    # role card either, even if a caller passes a correct value
+    # alongside success=False.
+    from agent_farm.profiles import _load_card, record_profile_run
+
+    assert record_profile_run("worker", "qwen3:4b", "write", 1.0, False, "error", True)
+    card = _load_card("worker", "qwen3:4b")
+    assert card["checked"] == 0
+    assert card["correct"] == 0
+    assert card["per_task_type"]["write"]["checked"] == 0
+
+
 def test_old_card_without_correctness_loads():
     # A card written before correctness was measured has no
     # checked / correct fields; loading it must fill them with
