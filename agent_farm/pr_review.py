@@ -24,6 +24,7 @@ import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
 from .ollama import sync_query_raw
+from .review_verify import verify_findings
 
 # The git executable review_branch shells out to. Bare "git"
 # works everywhere except the PC, where the scoop shim fails when
@@ -294,7 +295,20 @@ def review_diff(
     # Highest severity first, then file, then line.
     order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     findings.sort(key=lambda f: (order.get(f["severity"], 3), f["file"], f["line"]))
-    return {"files": reviewed, "findings": findings, "model": model}
+    # Verify every finding against the real files before
+    # reporting it. A finding the checks prove wrong is dropped;
+    # the drop is reported, not hidden, so a model that
+    # hallucinates is visible in the result.
+    kept, rejected = verify_findings(findings, contents)
+    return {
+        "files": reviewed,
+        "findings": kept,
+        "model": model,
+        "rejected_findings": [
+            {"finding": finding, "reason": reason}
+            for finding, reason in rejected
+        ],
+    }
 
 
 def review_branch(
