@@ -81,7 +81,7 @@ def sync_query_raw(model: str, prompt: str) -> str:
 def synthesize_swarm_results(results: List[Dict], task_context: str = "") -> str:
     """
     Synthesize swarm results into a unified summary using the synthesizer model.
-    Uses the synthesizer tier (qwen2.5:14b) for accuracy; no model
+    Uses the synthesizer tier (qwen3:30b-a3b-q3k) for accuracy; no model
     guarantees zero hallucinations, so summaries still need checking.
     
     Args:

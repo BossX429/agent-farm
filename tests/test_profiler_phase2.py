@@ -322,7 +322,7 @@ def test_mixed_model_roles_are_distinct():
     # Roles deliberately run different models: the code-facing
     # roles (worker writes code, learner analyzes it) use the
     # code-tuned model, the fast roles stay on qwen3:4b, and the
-    # synthesizer keeps qwen2.5:14b. If every role ran the same
+    # synthesizer keeps qwen3:30b-a3b-q3k. If every role ran the same
     # model, the profiler would measure timing noise between
     # identical workers instead of real differences.
     assert MODEL_TIERS["worker"] == "qwen2.5-coder:7b-v8-review"
@@ -330,7 +330,20 @@ def test_mixed_model_roles_are_distinct():
     assert MODEL_TIERS["scout"] == "qwen3:4b"
     assert MODEL_TIERS["memory"] == "qwen3:4b"
     assert MODEL_TIERS["guardian"] == "qwen3:4b"
-    assert MODEL_TIERS["synthesizer"] == "qwen2.5:14b"
+    assert MODEL_TIERS["synthesizer"] == "qwen3:30b-a3b-q3k"
+
+def test_synthesizer_is_the_30b_reasoning_model():
+    # The synthesizer is the heavy-reasoning role: it runs AFTER
+    # colony work completes, so Ollama evicts the finished colony
+    # models to make room for the 14.7GB 30b. It must be the 30b
+    # (not the old 14b), and it must be distinct from every colony
+    # role's model, so the profiler measures a real difference.
+    assert MODEL_TIERS["synthesizer"] == "qwen3:30b-a3b-q3k"
+    colony_models = {
+        MODEL_TIERS[role]
+        for role in ("scout", "worker", "memory", "guardian", "learner")
+    }
+    assert MODEL_TIERS["synthesizer"] not in colony_models
     # At least two different models are actually in use.
     assert len(set(MODEL_TIERS.values())) >= 3
 

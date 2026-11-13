@@ -21,18 +21,20 @@ OLLAMA_URL = "http://localhost:11434"
 # Roles use different models on purpose: the code-facing roles
 # (worker writes code, learner analyzes it) run the code-tuned
 # qwen2.5-coder, while scout/memory/guardian stay on the fast
-# qwen3:4b. The synthesizer deliberately uses qwen2.5:14b
-# (8.99GB) for accuracy on result synthesis, so it is NOT a
-# 4b tier. Different models per role is what lets the profiler
-# measure real differences instead of timing noise between
-# identical workers.
+# qwen3:4b. The synthesizer deliberately uses qwen3:30b-a3b-q3k
+# (14.7GB) for accuracy on result synthesis, so it is NOT a
+# 4b tier. It runs AFTER colony work completes, so Ollama evicts
+# the finished colony models to make room; it never shares VRAM
+# with two 8.1GB coder workers. Different models per role is what
+# lets the profiler measure real differences instead of timing
+# noise between identical workers.
 MODEL_TIERS = {
     "scout": "qwen3:4b",       # 2.5GB - reconnaissance
     "worker": "qwen2.5-coder:7b-v8-review",  # 8.1GB - task execution, code-tuned
     "memory": "qwen3:4b",      # 2.5GB - was 8b but inconsistent tool format
     "guardian": "qwen3:4b",    # 2.5GB - validation, protection
     "learner": "qwen2.5-coder:7b-v8-review",  # 8.1GB - code analysis, code-tuned
-    "synthesizer": "qwen2.5:14b",  # 8.99GB - synthesis/summarization (accuracy over speed)
+    "synthesizer": "qwen3:30b-a3b-q3k",  # 14.7GB - synthesis/summarization (accuracy over speed)
 }
 
 # Grounding instruction to prevent hallucination
