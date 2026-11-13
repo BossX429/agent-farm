@@ -325,8 +325,8 @@ def test_mixed_model_roles_are_distinct():
     # synthesizer keeps qwen3:30b-a3b-q3k. If every role ran the same
     # model, the profiler would measure timing noise between
     # identical workers instead of real differences.
-    assert MODEL_TIERS["worker"] == "qwen2.5-coder:7b-v8-review"
-    assert MODEL_TIERS["learner"] == "qwen2.5-coder:7b-v8-review"
+    assert MODEL_TIERS["worker"] == "qwen2.5-coder:7b"
+    assert MODEL_TIERS["learner"] == "qwen2.5-coder:7b"
     assert MODEL_TIERS["scout"] == "qwen3:4b"
     assert MODEL_TIERS["memory"] == "qwen3:4b"
     assert MODEL_TIERS["guardian"] == "qwen3:4b"
@@ -394,10 +394,20 @@ def test_synthesis_strips_think_block(monkeypatch):
     assert "Local AI keeps data private" in result
 
 
-def test_prompt_for_model_instructs_review_model():
+def test_prompt_for_model_instructs_review_model(monkeypatch):
     from agent_farm.state import prompt_for_model
+    import agent_farm.state as state_module
 
-    # The review-tuned coder gets the do-the-task instruction.
+    # No role uses a review-tuned model now, so the set is empty
+    # and the base coder gets no instruction. The mechanism is
+    # tested by putting the review model back in the set: it must
+    # get the do-the-task instruction.
+    assert prompt_for_model("qwen2.5-coder:7b", "write a function") == "write a function"
+    monkeypatch.setattr(
+        state_module,
+        "MODELS_NEEDING_TASK_INSTRUCTION",
+        frozenset({"qwen2.5-coder:7b-v8-review"}),
+    )
     instructed = prompt_for_model(
         "qwen2.5-coder:7b-v8-review", "write a function"
     )
@@ -409,7 +419,7 @@ def test_prompt_for_model_instructs_review_model():
     assert prompt_for_model("qwen2.5:14b", "write a function") == "write a function"
 
 
-def test_colony_sends_instruction_to_worker(monkeypatch):
+def test_colony_does_not_instruct_base_coder(monkeypatch):
     # A worker bug (review-tuned coder model) must receive the
     # do-the-task instruction, or it answers "CLEAN" instead of
     # doing the work. A scout bug (qwen3:4b) must NOT: the
@@ -431,10 +441,10 @@ def test_colony_sends_instruction_to_worker(monkeypatch):
         ],
         colony,
     )
-    worker_prompts = seen["qwen2.5-coder:7b-v8-review"]
+    worker_prompts = seen["qwen2.5-coder:7b"]
     assert worker_prompts, "worker was never called"
     for prompt in worker_prompts:
-        assert prompt.startswith("Do the task below")
+        assert "Do the task below" not in prompt
         assert "write a python function" in prompt
     scout_prompts = seen.get("qwen3:4b", [])
     assert scout_prompts, "scout was never called"
@@ -442,10 +452,10 @@ def test_colony_sends_instruction_to_worker(monkeypatch):
         assert "Do the task below" not in prompt
 
 
-def test_probe_sends_instruction_to_worker(monkeypatch):
-    # A probe for a worker bug must also carry the instruction,
-    # or the probe records a success for a "CLEAN" verdict and
-    # the card is inflated. Every captured prompt is checked (not
+def test_probe_does_not_instruct_base_coder(monkeypatch):
+    # A probe for a worker bug must NOT carry the instruction
+    # now: the base coder is not review-tuned, so it does the task
+    # without one. Every captured prompt is checked (not
     # just the last one per model): it must carry the instruction
     # AND the probe task and context, or a probe that sends only
     # the instruction would pass while recording garbage. A scout
@@ -461,10 +471,10 @@ def test_probe_sends_instruction_to_worker(monkeypatch):
     monkeypatch.setattr(probes_module, "sync_query_ollama", _capture)
     colony = spawn_colony_internal("standard")
     probes_module.run_probes(colony)
-    worker_prompts = seen["qwen2.5-coder:7b-v8-review"]
+    worker_prompts = seen["qwen2.5-coder:7b"]
     assert worker_prompts, "worker was never probed"
     for prompt in worker_prompts:
-        assert prompt.startswith("Do the task below")
+        assert "Do the task below" not in prompt
         assert "Task:" in prompt
         assert "Context:" in prompt
     scout_prompts = seen.get("qwen3:4b", [])
@@ -474,11 +484,11 @@ def test_probe_sends_instruction_to_worker(monkeypatch):
         assert "Task:" in prompt
 
 
-def test_chunked_tools_send_instruction_to_worker(monkeypatch):
+def test_chunked_tools_do_not_instruct_base_coder(monkeypatch):
     # A chunked section write uses the worker model directly
-    # (query_ollama_sync, no structured prompt), so it must also
-    # carry the do-the-task instruction or the section comes back
-    # as a "CLEAN" verdict.
+    # (query_ollama_sync, no structured prompt). The base coder is
+    # not review-tuned, so it must NOT carry the do-the-task
+    # instruction.
     import agent_farm.chunked_tools as chunked_tools_module
     import agent_farm.agent as agent_module
 
@@ -492,10 +502,10 @@ def test_chunked_tools_send_instruction_to_worker(monkeypatch):
     chunked_tools_module.generate_section_content(
         {"title": "Intro", "description": "An intro"}, "A doc", 1, 3
     )
-    worker_prompts = seen["qwen2.5-coder:7b-v8-review"]
+    worker_prompts = seen["qwen2.5-coder:7b"]
     assert worker_prompts, "worker was never called"
     for prompt in worker_prompts:
-        assert prompt.startswith("Do the task below")
+        assert "Do the task below" not in prompt
 
 
 def test_check_correctness_right_answers():
@@ -575,7 +585,7 @@ def test_probe_records_correctness_on_card(monkeypatch):
     monkeypatch.setattr(probes_module, "sync_query_ollama", _right)
     colony = spawn_colony_internal("standard")
     probes_module.run_probes(colony)
-    card = _load_card("worker", "qwen2.5-coder:7b-v8-review")
+    card = _load_card("worker", "qwen2.5-coder:7b")
     write_entry = card["per_task_type"]["write"]
     assert write_entry["checked"] >= 1
     assert write_entry["correct"] == write_entry["checked"]
@@ -599,7 +609,7 @@ def test_wrong_answer_does_not_count_as_correct(monkeypatch):
     monkeypatch.setattr(probes_module, "sync_query_ollama", _wrong)
     colony = spawn_colony_internal("standard")
     probes_module.run_probes(colony)
-    card = _load_card("worker", "qwen2.5-coder:7b-v8-review")
+    card = _load_card("worker", "qwen2.5-coder:7b")
     write_entry = card["per_task_type"]["write"]
     assert write_entry["checked"] >= 1
     assert write_entry["correct"] == 0
@@ -627,7 +637,7 @@ def test_old_card_without_correctness_loads():
 
     old = {
         "role": "worker",
-        "model": "qwen2.5-coder:7b-v8-review",
+        "model": "qwen2.5-coder:7b",
         "machine": "him",
         "samples": 10,
         "successes": 9,
@@ -640,7 +650,7 @@ def test_old_card_without_correctness_loads():
         "trusted": False,
         "stale": False,
     }
-    normalized = _normalize_card(old, "worker", "qwen2.5-coder:7b-v8-review")
+    normalized = _normalize_card(old, "worker", "qwen2.5-coder:7b")
     assert normalized is not None
     assert normalized["checked"] == 0
     assert normalized["correct"] == 0
@@ -676,7 +686,7 @@ def test_live_colony_bugs_carry_their_role_model(monkeypatch, tmp_path):
     # The standard colony has both models in it.
     models = {bug.model for bug in colony.bugs}
     assert "qwen3:4b" in models
-    assert "qwen2.5-coder:7b-v8-review" in models
+    assert "qwen2.5-coder:7b" in models
 
 
 def test_worker_card_is_keyed_by_coder_model(monkeypatch, tmp_path):
@@ -688,7 +698,7 @@ def test_worker_card_is_keyed_by_coder_model(monkeypatch, tmp_path):
     run_probes(colony)
     card = get_profile("worker", MODEL_TIERS["worker"])
     assert card is not None
-    assert card["model"] == "qwen2.5-coder:7b-v8-review"
+    assert card["model"] == "qwen2.5-coder:7b"
     assert card["samples"] == 5
     # No card exists for the worker under the old model.
     assert get_profile("worker", "qwen3:4b") is None
