@@ -6,7 +6,7 @@ line that is a for loop, a key the file does initialize. The
 model cannot be trusted to check itself, so every finding is
 checked against the actual file before it is reported.
 
-verify_findings(findings, file_contents) runs four deterministic
+verify_findings(findings, file_contents) runs five deterministic
 checks on each finding and drops the ones that fail:
 
 1. Line check -- the cited line exists in the file and is not
@@ -32,6 +32,11 @@ checks on each finding and drops the ones that fail:
    call fits, the finding is wrong and is dropped. A multi-line
    call does not parse from one line alone, so the check cannot
    run there and the finding is kept.
+5. Quote check -- any code a finding QUOTES must appear in the
+   file or the diff. A finding that quotes an assertion or an
+   expression that is nowhere to be found hallucinated it. A
+   lone identifier is a token, not a quote, and is checked by
+   the token check.
 
 A finding with no extractable code tokens cannot be checked by
 the token or signature checks, so it is kept. Verification only
@@ -94,6 +99,67 @@ def _line_is_code(line):
     return bool(stripped) and not stripped.startswith("#")
 
 
+def _extract_code_quotes(finding):
+    """Code a finding quotes: backticked spans that hold more
+    than one identifier (a space, an operator, a call, an
+    assertion). A lone identifier is a token, not a quote, and
+    is checked by the token check. A quote is a claim that the
+    code reads exactly that way, so it must appear in the file
+    or the diff."""
+    text = " ".join(
+        str(finding.get(key, ""))
+        for key in ("title", "body")
+    )
+    quotes = set()
+    for span in _BACKTICK_RE.findall(text):
+        stripped = span.strip()
+        # A quote holds code structure: a call, a keyword-led
+        # statement, or a comparison with an identifier on
+        # either side. A bare `name = literal` assignment is an
+        # example value, not a quote of the file, and a
+        # `name=value` pair describes arguments, not code, so
+        # neither counts.
+        if len(stripped) < 4:
+            continue
+        has_call = re.search(r"[A-Za-z_][A-Za-z0-9_]*\s*\(", stripped) is not None
+        has_keyword = stripped.split(None, 1)[0] in (
+            "assert", "if", "return", "def", "for", "while",
+            "raise", "import", "elif", "else",
+        )
+        has_comparison = re.search(
+            r"[A-Za-z_][A-Za-z0-9_]*\s*(==|!=|<=|>=)\s*\S", stripped
+        ) is not None or re.search(
+            r"\S\s*(==|!=|<=|>=)\s*[A-Za-z_]", stripped
+        ) is not None
+        if has_call or has_keyword or has_comparison:
+            quotes.add(stripped)
+    return quotes
+
+
+def _normalize_code(text):
+    """Collapse all whitespace to single spaces, so a quote
+    matches the file even when the model reflows it."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _check_quotes(finding, file_content, diff_text=""):
+    """Every code quote in the finding must appear in the file
+    or in the diff. A finding that quotes code that is nowhere
+    to be found hallucinated it. Returns a rejection reason,
+    or None."""
+    quotes = _extract_code_quotes(finding)
+    if not quotes:
+        return None
+    haystacks = [_normalize_code(file_content)]
+    if diff_text:
+        haystacks.append(_normalize_code(diff_text))
+    for quote in sorted(quotes):
+        norm = _normalize_code(quote)
+        if not any(norm in hay for hay in haystacks):
+            return f"quoted code not found in the file or the diff: {quote[:80]}"
+    return None
+
+
 def _check_line(finding, lines):
     """The cited line exists and is code. Returns a rejection
     reason, or None when the check passes or cannot run."""
@@ -107,7 +173,7 @@ def _check_line(finding, lines):
     return None
 
 
-def _check_tokens(finding, lines):
+def _check_tokens(finding, lines, diff_text=""):
     """A code token the finding names must appear within a window
     around the cited line. When the finding names an access
     (x["key"] or x.y), the access base is the token that must
@@ -135,6 +201,11 @@ def _check_tokens(finding, lines):
     end = min(len(lines), line_no + LINE_WINDOW)
     window = "\n".join(lines[start:end])
     if any(token in window for token in required):
+        return None
+    # A finding about removed code names code that lives only in
+    # the diff, not in the new file. If any required token is in
+    # the diff, the token check passes.
+    if diff_text and any(token in diff_text for token in required):
         return None
     return (
         f"none of the named code ({sorted(required)[:5]}) appears "
@@ -269,14 +340,17 @@ def _check_arg_count(finding, lines, file_contents):
     return None
 
 
-def verify_finding(finding, file_contents):
+def verify_finding(finding, file_contents, diff_texts=None):
     """Check one finding against the files in its review. The
-    line and token checks use the file the finding cites; the
-    signature check searches every reviewed file, because the
-    definition may live elsewhere. Returns (keep, reason): keep
-    is True when the finding survives, and reason names why it
-    was dropped, or None when kept."""
+    line, token, and quote checks use the file the finding
+    cites; the signature check searches every reviewed file,
+    because the definition may live elsewhere; the quote check
+    also searches the diff, because a finding may quote a line
+    the diff removed. Returns (keep, reason): keep is True when
+    the finding survives, and reason names why it was dropped,
+    or None when kept."""
     contents = file_contents or {}
+    diffs = diff_texts or {}
     content = contents.get(finding.get("file", ""), "")
     if not content:
         return True, None
@@ -284,7 +358,11 @@ def verify_finding(finding, file_contents):
     reason = _check_line(finding, lines)
     if reason is not None:
         return False, reason
-    reason = _check_tokens(finding, lines)
+    diff_text = diffs.get(finding.get("file", ""), "")
+    reason = _check_tokens(finding, lines, diff_text)
+    if reason is not None:
+        return False, reason
+    reason = _check_quotes(finding, content, diff_text)
     if reason is not None:
         return False, reason
     reason = _check_signature(finding, contents)
@@ -296,7 +374,7 @@ def verify_finding(finding, file_contents):
     return True, None
 
 
-def verify_findings(findings, file_contents):
+def verify_findings(findings, file_contents, diff_texts=None):
     """Verify every finding against the files in its review.
     Returns (kept, rejected), where rejected is a list of
     (finding, reason) pairs. A finding whose file has no content
@@ -304,7 +382,7 @@ def verify_findings(findings, file_contents):
     kept = []
     rejected = []
     for finding in findings:
-        keep, reason = verify_finding(finding, file_contents)
+        keep, reason = verify_finding(finding, file_contents, diff_texts)
         if keep:
             kept.append(finding)
         else:
