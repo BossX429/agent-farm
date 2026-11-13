@@ -186,6 +186,34 @@ REFACTORING SUGGESTIONS:"""
     }
 
 
+# ============ PR REVIEW ============
+
+@mcp.tool()
+@track_tool_run()
+async def review_pr(repo_path: str = "", base: str = "", head: str = "HEAD", diff: str = "") -> dict:
+    """
+    Review a pull-request diff the way Sourcery does: line by line,
+    looking for what breaks. Pass repo_path + base (+ head) to diff
+    two refs in a local git repo, or pass a unified diff directly
+    in diff. Returns structured findings (severity, file, line,
+    title, body), highest severity first. It does NOT post comments
+    on GitHub: posting speaks as the user, so that step needs the
+    user's go-ahead for the specific PR.
+    """
+    import time
+    from .pr_review import review_branch, review_diff
+
+    start = time.time()
+    if diff:
+        result = await asyncio.to_thread(review_diff, diff)
+    elif repo_path and base:
+        result = await asyncio.to_thread(review_branch, repo_path, base, head)
+    else:
+        return {"error": "Pass a unified diff in diff, or repo_path + base to diff two refs."}
+    result["elapsed_seconds"] = round(time.time() - start, 2)
+    return result
+
+
 # ============ EXECUTION SWARMS ============
 
 @mcp.tool()

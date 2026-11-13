@@ -33,6 +33,7 @@ from .colony_tools import (
     cleanup_idle,
 )
 from .swarm_tools import (
+    review_pr,
     code_review_swarm,
     code_gen_swarm,
     file_swarm,
@@ -68,6 +69,7 @@ __all__ = [
     "farm_stats",
     "dissolve_colony",
     "cleanup_idle",
+    "review_pr",
     "code_review_swarm",
     "code_gen_swarm",
     "file_swarm",
