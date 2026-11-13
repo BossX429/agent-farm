@@ -18,11 +18,18 @@ speaks as the user, so it needs the user's go-ahead for that
 specific PR.
 """
 
+import os
 import re
 import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
 from .ollama import sync_query_raw
+
+# The git executable review_branch shells out to. Bare "git"
+# works everywhere except the PC, where the scoop shim fails when
+# spawned from a Python subprocess -- there the caller sets
+# AGENT_FARM_GIT to the direct git.exe path.
+GIT_EXE = os.environ.get("AGENT_FARM_GIT", "git")
 from .state import MODEL_TIERS
 
 REVIEW_MODEL = MODEL_TIERS["synthesizer"]
@@ -38,6 +45,47 @@ _FINDING_RE = re.compile(
     r"\[(HIGH|MEDIUM|LOW)\]\s*(.+?)\nFile:\s*(.+?)\nLine:\s*(\d+)\nBody:\s*(.+?)(?=\n\[HIGH\]|\n\[MEDIUM\]|\n\[LOW\]|\Z)",
     re.DOTALL,
 )
+
+# Real review findings from Sourcery on this repo, shown to the
+# reviewer as examples of what a good finding looks like. Each
+# one names a concrete bug in the diff, with the file and line.
+# These are the standard the reviewer is held to: a finding must
+# be this specific, this grounded in the changed lines, and this
+# actionable. A vague or invented finding is worse than none.
+REVIEW_EXAMPLES = """EXAMPLE 1 -- a real finding (PR #24, Sourcery):
+Diff:
+```diff
+@@ -428,6 +428,10 @@
+             card["total_seconds"] += max(0.0, elapsed)
++            if correct is not None:
++                card["checked"] += 1
++                if correct:
++                    card["correct"] += 1
+             entry = card["per_task_type"][task_type]
+```
+Reviewer found:
+[MEDIUM] Failed answers inflate correctness
+File: agent_farm/colony_profiles.py
+Line: 431
+Body: When a caller passes a non-None correct value together with success=False, record_colony_run increments checked and possibly correct whenever correct is non-None, even when success is false. A caller that supplies both values records a failed response as a checked answer, skewing the correctness score used for routing. Only record correctness when success is true, or reject inconsistent arguments.
+
+EXAMPLE 2 -- a real finding (PR #23, Sourcery):
+Diff:
+```diff
+@@ -38,6 +38,15 @@
++    if task_type == "write":
++        norm = _norm(response)
++        return re.search(
++            r"return\\(?[a-z_][a-z0-9_]*\\+[a-z_][a-z0-9_]*\\)?", norm
++        ) is not None
+```
+Reviewer found:
+[MEDIUM] Unrelated code passes write check
+File: agent_farm/probes.py
+Line: 41
+Body: The write checker accepts any code containing a return of a sum, so an unrelated function that merely contains a sum passes. The context names the function "add", so the answer must define add. Require the normalized text to contain "defadd" as well as the return-sum pattern.
+
+"""
 
 REVIEW_PROMPT = """You are a senior code reviewer. Review the diff below the way a careful human reviewer would: read it line by line and ask what breaks.
 
@@ -59,13 +107,20 @@ File: path/to/file.py
 Line: 123
 Body: What is wrong, why it matters, and what to do about it.
 
+{examples}
 DIFF TO REVIEW:
 ```diff
 {diff}
 ```
+
+FULL FILE (the changed file after this diff, so you can see what the diff does not show -- how a key is initialized, whether a function is called elsewhere, what a test covers):
+```
+{file_content}
+```
 """
 
 MAX_DIFF_CHARS = 60000
+MAX_FILE_CHARS = 40000
 MAX_FILES = 20
 
 
@@ -163,11 +218,23 @@ def review_file_diff(
     diff_text: str,
     query_fn: Callable[[str, str], str] = sync_query_raw,
     model: str = REVIEW_MODEL,
+    file_content: str = "",
 ) -> List[Dict[str, Any]]:
-    """Review one file's diff. Returns structured findings."""
+    """Review one file's diff. Returns structured findings.
+
+    file_content is the file after the diff, so the reviewer can
+    see what the diff alone does not show (how a key is
+    initialized, whether a function is called elsewhere). Without
+    it the reviewer can only guess, and it will invent findings
+    about things the rest of the file already handles.
+    """
     if not diff_text:
         return []
-    prompt = REVIEW_PROMPT.format(diff=diff_text[:MAX_DIFF_CHARS])
+    prompt = REVIEW_PROMPT.format(
+        examples=REVIEW_EXAMPLES,
+        diff=diff_text[:MAX_DIFF_CHARS],
+        file_content=file_content[:MAX_FILE_CHARS],
+    )
     try:
         response = query_fn(model, prompt)
     except Exception as exc:  # noqa: BLE001 - a review must not raise
@@ -198,16 +265,31 @@ def review_diff(
     query_fn: Callable[[str, str], str] = sync_query_raw,
     model: str = REVIEW_MODEL,
     max_files: int = MAX_FILES,
+    file_contents: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Review a whole unified diff. Returns files reviewed and findings."""
+    """Review a whole unified diff. Returns files reviewed and findings.
+
+    file_contents maps a path to the file's content after the
+    diff, so the reviewer sees the full file, not just the
+    changed lines.
+    """
     files = parse_unified_diff(diff_text)
     if not files:
         return {"files": [], "findings": [], "error": "No changed files found in the diff."}
+    contents = file_contents or {}
     findings: List[Dict[str, Any]] = []
     reviewed: List[str] = []
     for entry in files[:max_files]:
         file_diff = "\n".join(entry["diff"])
-        findings.extend(review_file_diff(entry["path"], file_diff, query_fn, model))
+        findings.extend(
+            review_file_diff(
+                entry["path"],
+                file_diff,
+                query_fn,
+                model,
+                contents.get(entry["path"], ""),
+            )
+        )
         reviewed.append(entry["path"])
     # Highest severity first, then file, then line.
     order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
@@ -231,7 +313,7 @@ def review_branch(
         return {"files": [], "findings": [], "error": "repo_path and base are required."}
     try:
         proc = subprocess.run(
-            ["git", "-C", repo_path, "diff", f"{base}...{head}"],
+            [GIT_EXE, "-C", repo_path, "diff", f"{base}...{head}"],
             capture_output=True,
             text=True,
             timeout=60,
@@ -244,4 +326,18 @@ def review_branch(
             "findings": [],
             "error": f"git diff failed: {proc.stderr.strip() or proc.stdout.strip()}",
         }
-    return review_diff(proc.stdout, query_fn, model)
+    # Fetch each changed file's content at head, so the reviewer
+    # sees the full file. A file that cannot be read (deleted,
+    # binary) is reviewed from the diff alone.
+    files = parse_unified_diff(proc.stdout)
+    contents: Dict[str, str] = {}
+    for entry in files:
+        show = subprocess.run(
+            [GIT_EXE, "-C", repo_path, "show", f"{head}:{entry['path']}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if show.returncode == 0:
+            contents[entry["path"]] = show.stdout
+    return review_diff(proc.stdout, query_fn, model, file_contents=contents)

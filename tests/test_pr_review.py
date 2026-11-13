@@ -106,7 +106,10 @@ def test_review_file_diff_returns_structured_findings():
 
 def test_review_diff_sorts_by_severity():
     def _two_findings(model, prompt):
-        if "profiles.py" in prompt:
+        # Route on the diff header, not on a bare filename: the
+        # review examples mention colony_profiles.py, which
+        # contains "profiles.py" as a substring.
+        if "diff --git a/agent_farm/profiles.py" in prompt:
             return """[LOW] Minor nit
 File: agent_farm/profiles.py
 Line: 13
@@ -122,6 +125,93 @@ Body: Bad.
     assert result["files"] == ["agent_farm/profiles.py", "README.md"]
     assert result["findings"][0]["severity"] == "HIGH"
     assert result["findings"][1]["severity"] == "LOW"
+
+
+def test_review_prompt_includes_examples_and_file():
+    # The reviewer must see the full file and the Sourcery
+    # examples: without the file it invents findings about things
+    # the rest of the file already handles, and without the
+    # examples it has no standard for what a good finding is.
+    seen = {}
+
+    def _capture(model, prompt):
+        seen["prompt"] = prompt
+        return "No issues found"
+
+    review_file_diff(
+        "agent_farm/profiles.py",
+        "diff --git a/agent_farm/profiles.py b/agent_farm/profiles.py\n+new line",
+        query_fn=_capture,
+        file_content="def normalize():\n    return 0\n",
+    )
+    prompt = seen["prompt"]
+    assert "EXAMPLE 1" in prompt
+    assert "EXAMPLE 2" in prompt
+    assert "Failed answers inflate correctness" in prompt
+    assert "def normalize():" in prompt
+
+
+def test_review_diff_passes_file_contents():
+    # file_contents reach the per-file review: the fake model
+    # records the prompt for each file, and the file content must
+    # be in it.
+    prompts = {}
+
+    def _capture(model, prompt):
+        prompts[model] = prompt
+        return "No issues found"
+
+    seen_prompts = []
+
+    def _per_file(model, prompt):
+        seen_prompts.append(prompt)
+        return "No issues found"
+
+    result = review_diff(
+        _DIFF,
+        query_fn=_per_file,
+        file_contents={"agent_farm/profiles.py": "FULL PROFILES CONTENT"},
+    )
+    assert result["files"] == ["agent_farm/profiles.py", "README.md"]
+    assert any("FULL PROFILES CONTENT" in p for p in seen_prompts)
+    # The README prompt must NOT carry the profiles content.
+    readme_prompts = [
+        p for p in seen_prompts if "diff --git a/README.md" in p
+    ]
+    assert readme_prompts
+    assert all("FULL PROFILES CONTENT" not in p for p in readme_prompts)
+
+
+def test_review_branch_uses_git_exe_env(monkeypatch, tmp_path):
+    # AGENT_FARM_GIT must be honored: on the PC bare "git" is a
+    # scoop shim that cannot spawn from a Python subprocess, so
+    # the caller points at the direct git.exe. A fake git records
+    # its arguments; if the code ignored GIT_EXE and ran bare
+    # git, the fake would never be called and no record appears.
+    import os
+    import stat
+
+    import agent_farm.pr_review as pr
+
+    record = tmp_path / "calls.txt"
+    if os.name == "nt":
+        # Windows has no sh: the fake git is a batch file.
+        fake_git = tmp_path / "fake-git.bat"
+        fake_git.write_text(f"@echo off\r\necho %* >> {record}\r\nexit /b 0\r\n")
+    else:
+        fake_git = tmp_path / "fake-git"
+        fake_git.write_text(
+            "#!/bin/sh\n"
+            f"echo \"$@\" >> {record}\n"
+            "exit 0\n"
+        )
+        fake_git.chmod(fake_git.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setattr(pr, "GIT_EXE", str(fake_git))
+    result = pr.review_branch(str(tmp_path), "main", "HEAD")
+    assert result["files"] == []
+    assert result["findings"] == []
+    calls = record.read_text()
+    assert "diff main...HEAD" in calls
 
 
 def test_review_diff_empty_returns_error():
