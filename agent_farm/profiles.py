@@ -553,6 +553,9 @@ def profiles_summary() -> List[Dict[str, Any]]:
             "success_rate": card["success_rate"],
             "avg_seconds": card["avg_seconds"],
             "stale": card["stale"],
+            "checked": card.get("checked", 0),
+            "correct": card.get("correct", 0),
+            "correctness_rate": card.get("correctness_rate", 0.0),
         }
         for card in list_profiles()
     ]

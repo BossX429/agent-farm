@@ -102,25 +102,45 @@ def check_correctness(task_type: str, response: Any) -> Any:
     if stripped.startswith("Error:") or stripped.startswith("UNCERTAIN"):
         return None
     if task_type == "write":
-        # The function must define a function that returns the
-        # sum of its two arguments. Any variable names count
-        # ("a + b", "x+y"), but a subtraction does not.
+        # The context names the function "add", so the answer
+        # must define add and return the sum of its two
+        # arguments. Any variable names count ("a + b", "x+y",
+        # "a1 + b2"), and parentheses around the sum count too,
+        # but a subtraction does not, and an unrelated function
+        # that merely contains a sum does not count.
         norm = _norm(response)
-        return "def" in norm and re.search(
-            r"return[a-z_]+\+[a-z_]+", norm
+        return "defadd" in norm and re.search(
+            r"return\(?[a-z_][a-z0-9_]*\+[a-z_][a-z0-9_]*\)?", norm
         ) is not None
     if task_type == "analyze":
-        # The problem is dividing by len(nums) when nums is empty.
+        # The problem is dividing by len(nums) when nums is
+        # empty. "division" or "empty" name it directly. A bare
+        # "zero" does not: it must come with the cause ("len",
+        # a crash, a failure, an error), or "the answer is zero"
+        # would pass without identifying the problem.
         lowered = response.lower()
-        return any(w in lowered for w in ("empty", "zero", "division"))
+        if "division" in lowered or "empty" in lowered:
+            return True
+        if "zero" in lowered:
+            return any(
+                w in lowered for w in ("len", "crash", "fail", "error")
+            )
+        return False
     if task_type == "search":
-        # Colony C has the most bugs. The word "C" is the answer;
-        # "A" and "B" do not contain it. The count (6) is not
+        # Colony C has the most bugs. The word "C" is the answer,
+        # and "the third colony" is the same answer in words;
+        # "A" and "B" do not contain either. The count (6) is not
         # required: a bare "C" is still correct.
-        return _has_word(response, "c")
+        return _has_word(response, "c") or "third" in response.lower()
     if task_type == "check":
-        # The ollama service is up.
-        return _has_word(response, "up")
+        # The ollama service is up. "running" and "online" are
+        # the same answer in different words.
+        lowered = response.lower()
+        return (
+            _has_word(response, "up")
+            or "running" in lowered
+            or "online" in lowered
+        )
     if task_type == "list":
         # The Python files are main.py and helper.py.
         lowered = response.lower()

@@ -505,14 +505,20 @@ def test_check_correctness_right_answers():
 
     assert check_correctness("write", "def add(a, b):\n    return a + b") is True
     assert check_correctness("write", "Here it is: def add(x, y): return x+y") is True
+    assert check_correctness("write", "def add(a, b): return (a + b)") is True
+    assert check_correctness("write", "def add(a1, b2): return a1 + b2") is True
     assert check_correctness(
         "analyze", "The bug is a division by zero when the list is empty."
     ) is True
     assert check_correctness("analyze", "len(nums) is zero, so it crashes.") is True
+    assert check_correctness("analyze", "The list is empty, so it fails.") is True
     assert check_correctness("search", "Colony C has the most bugs, 6.") is True
     assert check_correctness("search", "C") is True
+    assert check_correctness("search", "The third colony has the most bugs.") is True
     assert check_correctness("check", "The ollama service is up.") is True
     assert check_correctness("check", "up") is True
+    assert check_correctness("check", "Ollama is running.") is True
+    assert check_correctness("check", "Ollama is online.") is True
     assert check_correctness("list", "The Python files are main.py and helper.py.") is True
 
 
@@ -523,8 +529,19 @@ def test_check_correctness_wrong_answers():
     assert check_correctness("write", "def add(a, b):\n    return a - b") is False
     assert check_correctness("write", "CLEAN") is False
     assert check_correctness("write", "Here is the function.") is False
+    # An unrelated function that happens to contain a sum is not
+    # the requested add function.
+    assert check_correctness(
+        "write", "def multiply(x, y): return x * y\n# and a + b is 5"
+    ) is False
+    # A function with the wrong name that returns a sum is not
+    # the requested add function either.
+    assert check_correctness(
+        "write", "def subtract(a, b):\n    return a + b"
+    ) is False
     assert check_correctness("analyze", "The code looks fine.") is False
     assert check_correctness("analyze", "BUGGY") is False
+    assert check_correctness("analyze", "The answer is zero.") is False
     assert check_correctness("search", "Colony A has the most bugs, 4.") is False
     assert check_correctness("search", "Colony B") is False
     assert check_correctness("check", "The ollama service is down.") is False
@@ -564,6 +581,29 @@ def test_probe_records_correctness_on_card(monkeypatch):
     assert write_entry["correct"] == write_entry["checked"]
     assert write_entry["correctness_rate"] == 1.0
     assert card["correctness_rate"] > 0.0
+
+
+def test_wrong_answer_does_not_count_as_correct(monkeypatch):
+    # Recording a checked WRONG answer must increment checked
+    # but not correct, and correctness_rate must be 0.0. A bug
+    # that increments correct for a false result would pass the
+    # right-answer test while inflating the card.
+    import agent_farm.probes as probes_module
+    from agent_farm.profiles import _load_card
+
+    def _wrong(model, prompt, **kwargs):
+        # Every probe job gets a wrong answer: the write probe
+        # gets a subtraction, the others get a wrong value.
+        return "def add(a, b):\n    return a - b"
+
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _wrong)
+    colony = spawn_colony_internal("standard")
+    probes_module.run_probes(colony)
+    card = _load_card("worker", "qwen2.5-coder:7b-v8-review")
+    write_entry = card["per_task_type"]["write"]
+    assert write_entry["checked"] >= 1
+    assert write_entry["correct"] == 0
+    assert write_entry["correctness_rate"] == 0.0
 
 
 def test_old_card_without_correctness_loads():
@@ -833,6 +873,9 @@ def test_farm_stats_includes_profiles(monkeypatch, tmp_path):
         "success_rate": 1.0,
         "avg_seconds": 0.1,
         "stale": False,
+        "checked": 0,
+        "correct": 0,
+        "correctness_rate": 0.0,
     }]
 
 
