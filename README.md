@@ -179,6 +179,10 @@ planner does not stall the async event loop.
 | Learner | qwen2.5-coder:7b-v8-review | 8.1GB | Pattern acquisition (code-tuned) |
 | **Synthesizer** | **qwen3:30b-a3b-q3k** | **14.7GB** | **Result synthesis** |
 
+> **Prerequisite:** pull the synthesizer model before upgrading, or
+> synthesis and code review fail with a model-not-found error:
+> `ollama pull qwen3:30b-a3b-q3k` (14.7GB).
+
 Code review, code generation, and KMKB synthesis use the synthesizer tier,
 not a separate model.
 
