@@ -498,6 +498,143 @@ def test_chunked_tools_send_instruction_to_worker(monkeypatch):
         assert prompt.startswith("Do the task below")
 
 
+def test_check_correctness_right_answers():
+    # Every probe job's known right answer passes, even when
+    # phrased differently.
+    from agent_farm.probes import check_correctness
+
+    assert check_correctness("write", "def add(a, b):\n    return a + b") is True
+    assert check_correctness("write", "Here it is: def add(x, y): return x+y") is True
+    assert check_correctness("write", "def add(a, b): return (a + b)") is True
+    assert check_correctness("write", "def add(a1, b2): return a1 + b2") is True
+    assert check_correctness(
+        "analyze", "The bug is a division by zero when the list is empty."
+    ) is True
+    assert check_correctness("analyze", "len(nums) is zero, so it crashes.") is True
+    assert check_correctness("analyze", "The list is empty, so it fails.") is True
+    assert check_correctness("search", "Colony C has the most bugs, 6.") is True
+    assert check_correctness("search", "C") is True
+    assert check_correctness("search", "The third colony has the most bugs.") is True
+    assert check_correctness("check", "The ollama service is up.") is True
+    assert check_correctness("check", "up") is True
+    assert check_correctness("check", "Ollama is running.") is True
+    assert check_correctness("check", "Ollama is online.") is True
+    assert check_correctness("list", "The Python files are main.py and helper.py.") is True
+
+
+def test_check_correctness_wrong_answers():
+    # A wrong answer, a bare verdict, and a vague dodge all fail.
+    from agent_farm.probes import check_correctness
+
+    assert check_correctness("write", "def add(a, b):\n    return a - b") is False
+    assert check_correctness("write", "CLEAN") is False
+    assert check_correctness("write", "Here is the function.") is False
+    # An unrelated function that happens to contain a sum is not
+    # the requested add function.
+    assert check_correctness(
+        "write", "def multiply(x, y): return x * y\n# and a + b is 5"
+    ) is False
+    # A function with the wrong name that returns a sum is not
+    # the requested add function either.
+    assert check_correctness(
+        "write", "def subtract(a, b):\n    return a + b"
+    ) is False
+    assert check_correctness("analyze", "The code looks fine.") is False
+    assert check_correctness("analyze", "BUGGY") is False
+    assert check_correctness("analyze", "The answer is zero.") is False
+    assert check_correctness("search", "Colony A has the most bugs, 4.") is False
+    assert check_correctness("search", "Colony B") is False
+    assert check_correctness("check", "The ollama service is down.") is False
+    assert check_correctness("list", "The files are notes.txt and README.md.") is False
+    assert check_correctness("list", "main.py") is False  # helper.py missing
+
+
+def test_check_correctness_no_judgment():
+    # A failed response is not an incorrect answer, and an
+    # unknown task type has no checker.
+    from agent_farm.probes import check_correctness
+
+    assert check_correctness("write", "") is None
+    assert check_correctness("write", None) is None
+    assert check_correctness("write", "Error: timeout") is None
+    assert check_correctness("general", "anything") is None
+
+
+def test_probe_records_correctness_on_card(monkeypatch):
+    # A probe run records correctness on the card: a right
+    # answer counts as correct, and the card's correctness_rate
+    # reflects it. A wrong answer counts as checked but not
+    # correct.
+    import agent_farm.probes as probes_module
+    from agent_farm.profiles import _load_card
+
+    def _right(model, prompt, **kwargs):
+        # The write probe's context asks for the add function.
+        return "def add(a, b):\n    return a + b"
+
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _right)
+    colony = spawn_colony_internal("standard")
+    probes_module.run_probes(colony)
+    card = _load_card("worker", "qwen2.5-coder:7b-v8-review")
+    write_entry = card["per_task_type"]["write"]
+    assert write_entry["checked"] >= 1
+    assert write_entry["correct"] == write_entry["checked"]
+    assert write_entry["correctness_rate"] == 1.0
+    assert card["correctness_rate"] > 0.0
+
+
+def test_wrong_answer_does_not_count_as_correct(monkeypatch):
+    # Recording a checked WRONG answer must increment checked
+    # but not correct, and correctness_rate must be 0.0. A bug
+    # that increments correct for a false result would pass the
+    # right-answer test while inflating the card.
+    import agent_farm.probes as probes_module
+    from agent_farm.profiles import _load_card
+
+    def _wrong(model, prompt, **kwargs):
+        # Every probe job gets a wrong answer: the write probe
+        # gets a subtraction, the others get a wrong value.
+        return "def add(a, b):\n    return a - b"
+
+    monkeypatch.setattr(probes_module, "sync_query_ollama", _wrong)
+    colony = spawn_colony_internal("standard")
+    probes_module.run_probes(colony)
+    card = _load_card("worker", "qwen2.5-coder:7b-v8-review")
+    write_entry = card["per_task_type"]["write"]
+    assert write_entry["checked"] >= 1
+    assert write_entry["correct"] == 0
+    assert write_entry["correctness_rate"] == 0.0
+
+
+def test_old_card_without_correctness_loads():
+    # A card written before correctness was measured has no
+    # checked / correct fields; loading it must fill them with
+    # zero instead of breaking.
+    from agent_farm.profiles import _normalize_card
+
+    old = {
+        "role": "worker",
+        "model": "qwen2.5-coder:7b-v8-review",
+        "machine": "him",
+        "samples": 10,
+        "successes": 9,
+        "failures": 1,
+        "success_rate": 0.9,
+        "total_seconds": 50.0,
+        "avg_seconds": 5.0,
+        "per_task_type": {},
+        "failure_modes": {},
+        "trusted": False,
+        "stale": False,
+    }
+    normalized = _normalize_card(old, "worker", "qwen2.5-coder:7b-v8-review")
+    assert normalized is not None
+    assert normalized["checked"] == 0
+    assert normalized["correct"] == 0
+    assert normalized["correctness_rate"] == 0.0
+    assert normalized["per_task_type"]["write"]["checked"] == 0
+
+
 def test_synthesizer_is_the_30b_reasoning_model():
     # The synthesizer is the heavy-reasoning role: it runs AFTER
     # colony work completes, so Ollama evicts the finished colony
@@ -736,6 +873,9 @@ def test_farm_stats_includes_profiles(monkeypatch, tmp_path):
         "success_rate": 1.0,
         "avg_seconds": 0.1,
         "stale": False,
+        "checked": 0,
+        "correct": 0,
+        "correctness_rate": 0.0,
     }]
 
 

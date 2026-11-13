@@ -23,6 +23,7 @@ PROBE_WALL_BUDGET_SECONDS, and jobs still running then are
 reported as incomplete.
 """
 
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
@@ -63,6 +64,89 @@ PROBE_JOBS = [
         "prompt": "From the context, list the Python files.",
     },
 ]
+
+# Correctness: every probe job has one known right answer, so
+# correctness is a deterministic check, not a second model
+# judging (which would cost VRAM and add its own errors). A
+# checker returns True when the response gives the right answer,
+# False when it gives a wrong one, and None when there is nothing
+# to judge: a failed response (error / empty / UNCERTAIN) is a
+# failure, not an incorrect answer, and a task type with no
+# checker is not measured. Correctness is only meaningful on
+# usable answers: among the answers a model gave, how many were
+# right? A bare verdict ("CLEAN") fails every checker, and a
+# vague dodge fails too, while a right answer passes even if it
+# is phrased differently.
+def _norm(text: str) -> str:
+    """Lowercase with all whitespace removed, for substring checks."""
+    return re.sub(r"\s+", "", (text or "").lower())
+
+
+def _has_word(text: str, word: str) -> bool:
+    """True when word appears as a whole word (case-insensitive)."""
+    return re.search(r"\b" + re.escape(word) + r"\b", text or "", re.IGNORECASE) is not None
+
+
+def check_correctness(task_type: str, response: Any) -> Any:
+    """Check one probe response against the job's known answer.
+
+    Returns True (right), False (wrong), or None (no judgment:
+    the response is not a usable answer, or the task type has
+    no checker). Callers pass only usable answers.
+    """
+    if not isinstance(response, str) or not response.strip():
+        return None
+    stripped = response.strip()
+    # An error or a grounded refusal is not a wrong answer; it
+    # is a failure, judged by classify_result, not here.
+    if stripped.startswith("Error:") or stripped.startswith("UNCERTAIN"):
+        return None
+    if task_type == "write":
+        # The context names the function "add", so the answer
+        # must define add and return the sum of its two
+        # arguments. Any variable names count ("a + b", "x+y",
+        # "a1 + b2"), and parentheses around the sum count too,
+        # but a subtraction does not, and an unrelated function
+        # that merely contains a sum does not count.
+        norm = _norm(response)
+        return "defadd" in norm and re.search(
+            r"return\(?[a-z_][a-z0-9_]*\+[a-z_][a-z0-9_]*\)?", norm
+        ) is not None
+    if task_type == "analyze":
+        # The problem is dividing by len(nums) when nums is
+        # empty. "division" or "empty" name it directly. A bare
+        # "zero" does not: it must come with the cause ("len",
+        # a crash, a failure, an error), or "the answer is zero"
+        # would pass without identifying the problem.
+        lowered = response.lower()
+        if "division" in lowered or "empty" in lowered:
+            return True
+        if "zero" in lowered:
+            return any(
+                w in lowered for w in ("len", "crash", "fail", "error")
+            )
+        return False
+    if task_type == "search":
+        # Colony C has the most bugs. The word "C" is the answer,
+        # and "the third colony" is the same answer in words;
+        # "A" and "B" do not contain either. The count (6) is not
+        # required: a bare "C" is still correct.
+        return _has_word(response, "c") or "third" in response.lower()
+    if task_type == "check":
+        # The ollama service is up. "running" and "online" are
+        # the same answer in different words.
+        lowered = response.lower()
+        return (
+            _has_word(response, "up")
+            or "running" in lowered
+            or "online" in lowered
+        )
+    if task_type == "list":
+        # The Python files are main.py and helper.py.
+        lowered = response.lower()
+        return "main.py" in lowered and "helper.py" in lowered
+    return None
+
 
 # A probe run never takes longer than this wall time to return.
 # A slow model can otherwise delay colony creation for minutes
@@ -166,6 +250,9 @@ def run_probes(colony: Colony) -> List[Dict[str, Any]]:
                 started = time.monotonic()
             elapsed = time.monotonic() - started
             success, failure_kind = classify_result(response, error)
+            # Correctness is only judged on a usable answer: a
+            # failed response is a failure, not a wrong answer.
+            correct = check_correctness(job["task_type"], response) if success else None
             # The save result is reported on the probe, not
             # swallowed: a caller that sees profile_saved False
             # knows the run was not stored.
@@ -176,6 +263,7 @@ def run_probes(colony: Colony) -> List[Dict[str, Any]]:
                 elapsed,
                 success,
                 failure_kind,
+                correct,
             )
             # Colony-type measurement: the same probe run feeds
             # the colony type's card, so a new colony type earns
@@ -196,6 +284,7 @@ def run_probes(colony: Colony) -> List[Dict[str, Any]]:
                 "task_type": job["task_type"],
                 "status": "success" if success else "failed",
                 "failure_kind": failure_kind,
+                "correct": correct,
                 "elapsed_seconds": round(elapsed, 2),
                 "started_monotonic": started,
                 "profile_saved": saved,
