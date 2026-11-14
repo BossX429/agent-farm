@@ -153,6 +153,30 @@ BLOCKED_COMMANDS = [
 ]
 
 
+def _clean_path(raw: str) -> str:
+    """Strip model-mangled characters off a path before canonicalizing.
+
+    A model writing a Windows path as JSON can end it with a literal
+    quote: a trailing backslash before the closing quote is read as
+    an escaped quote, so the path gains a trailing '"' and Windows
+    rejects it with WinError 123. Strip surrounding whitespace and
+    quotes and trailing separators (but keep a drive root like C:\
+    intact), so a mangled path still resolves instead of erroring.
+    """
+    s = str(raw).strip().strip('"').strip("'").strip()
+    # Trailing separators: keep a drive root ("C:" / "C:\") and the
+    # filesystem root ("/") intact, strip them everywhere else.
+    while len(s) > 1 and s[-1] in ("\\", "/"):
+        if len(s) == 2 and s[1] == ":":
+            break
+        if len(s) == 3 and s[1] == ":" and s[2] in ("\\", "/"):
+            break
+        s = s[:-1]
+    if len(s) == 2 and s[1] == ":":
+        s += "\\"
+    return s
+
+
 def _canonical_path(path: str) -> str:
     """Expand ~ / env vars and resolve symlinks and '..' components.
 
@@ -160,7 +184,7 @@ def _canonical_path(path: str) -> str:
     directory that is a symlink) even when the final file does not exist
     yet, which is exactly what write-path checks need.
     """
-    return os.path.realpath(expand_path(path))
+    return os.path.realpath(expand_path(_clean_path(path)))
 
 
 def _is_within(path: str, directory: str) -> bool:

@@ -614,6 +614,46 @@ def test_structured_prompt_names_search_code_and_workdir(monkeypatch, tmp_path):
     assert "Do not invent paths" in prompt
 
 
+def test_structured_prompt_has_forward_slash_rule_and_examples(monkeypatch, tmp_path):
+    # Web research for the 3 remaining 25-test failures: the model
+    # mangles Windows paths in JSON (trailing backslash becomes an
+    # escaped quote) and picks search_code when it should list a
+    # directory. The prompt must show forward slashes, the
+    # list_dir-before-search_code pair, and the retry-on-empty rule.
+    import os
+    from agent_farm.agent import build_structured_prompt
+
+    monkeypatch.chdir(tmp_path)
+    prompt = build_structured_prompt("scout", "list the Python files")
+    assert "forward slashes" in prompt
+    assert "C:/Users/kyleh/agent-farm" in prompt
+    assert "DO NOT USE to discover what files exist" in prompt
+    assert "DO NOT USE to search inside files" in prompt
+    assert 'do NOT answer "no results found"' in prompt
+    # The few-shot examples themselves (not just the descriptions):
+    # the list-vs-search pair and the search example must be present.
+    assert 'TASK: "List the Python files in the agent_farm folder" -> list_dir' in prompt
+    assert 'TASK: "Where is the synthesizer model named?" -> search_code' in prompt
+    assert "WORKING DIRECTORY: " + os.getcwd().replace("\\", "/") in prompt
+
+
+def test_is_empty_result_labels_empty_and_nonempty():
+    # The retry fix keys off this: an empty result must be detected
+    # so the loop tries another tool instead of forcing an answer.
+    from agent_farm.agent import _is_empty_result, _summarize_result
+
+    assert _is_empty_result({"total_matches": 0, "matches": []})
+    assert _is_empty_result({"items": [], "count": 0})
+    assert _is_empty_result({"error": "boom"})
+    assert _is_empty_result({"stdout": ""})
+    assert _is_empty_result({"content": "   "})
+    assert not _is_empty_result({"total_matches": 1, "matches": [{"file": "a.py"}]})
+    assert not _is_empty_result({"items": ["a.py"], "count": 1})
+    assert not _is_empty_result({"stdout": "hello"})
+    assert "does NOT prove nothing exists" in _summarize_result({"total_matches": 0, "matches": []})
+    assert "does NOT prove" in _summarize_result({"items": [], "count": 0})
+
+
 def test_quick_swarm_routes_search_through_tool_path(monkeypatch):
     # The 25-test proved the plain path cannot do system-state
     # tasks: it has no tools, so the model answers UNCERTAIN.

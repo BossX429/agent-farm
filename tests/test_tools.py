@@ -259,6 +259,32 @@ def test_search_code_skips_pycache(tmp_path):
     assert result["total_matches"] == 0
 
 
+# ---------- _clean_path (mangled model paths) ----------
+
+def test_clean_path_strips_trailing_quote_and_separator():
+    # The PR #30 live proof: the model wrote a Windows path ending in
+    # backslash-quote, which JSON reads as a literal trailing quote and
+    # Windows rejects with WinError 123.
+    assert tools._clean_path('C:\\Users\\kyleh\\agent-farm\\"') == "C:\\Users\\kyleh\\agent-farm"
+    assert tools._clean_path('"C:/Users/kyleh/agent-farm/"') == "C:/Users/kyleh/agent-farm"
+    assert tools._clean_path("  C:/Users/kyleh/agent-farm/  ") == "C:/Users/kyleh/agent-farm"
+
+
+def test_clean_path_keeps_drive_root():
+    assert tools._clean_path("C:\\") == "C:\\"
+    assert tools._clean_path("C:") == "C:\\"
+    assert tools._clean_path("/") == "/"
+
+
+def test_canonical_path_sanitizes_mangled_windows_path(tmp_path):
+    # A mangled path must resolve to the real directory, not error.
+    mangled = '"' + str(tmp_path) + '/"'
+    assert tools._canonical_path(mangled) == str(tmp_path)
+    result = tools.tool_list_dir(mangled)
+    assert "error" not in result
+    assert result["count"] == 0
+
+
 # ---------- git resolution in exec_cmd ----------
 
 def test_resolve_git_uses_env_path(monkeypatch):

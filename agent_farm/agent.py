@@ -139,17 +139,17 @@ def build_structured_prompt(role: str, task: str, context: str = "") -> str:
         elif t == "process_list":
             tool_info.append("process_list (arg: cpu or memory) - list top processes")
         elif t == "disk_usage":
-            tool_info.append("disk_usage (arg: path like /) - check disk space")
+            tool_info.append("disk_usage (arg: path like /) - check disk space. Write the path with forward slashes, e.g. C:/Users/kyleh/agent-farm - never backslashes")
         elif t == "check_service":
             tool_info.append("check_service (arg: service name) - check if service running")
         elif t == "exec_cmd":
             tool_info.append("exec_cmd (arg: shell command) - run any shell command")
         elif t == "search_code":
-            tool_info.append("search_code (arg: pattern) - search file contents for a pattern, in the working directory")
+            tool_info.append("search_code (arg: pattern) - search INSIDE files for a text pattern, in the working directory. USE WHEN you know the text to find. DO NOT USE to discover what files exist - use list_dir first")
         elif t == "read_file":
             tool_info.append("read_file (arg: file path) - read file contents")
         elif t == "list_dir":
-            tool_info.append("list_dir (arg: directory path) - list directory contents")
+            tool_info.append("list_dir (arg: directory path) - list the files in a directory. USE WHEN you need to discover what files exist. DO NOT USE to search inside files - use search_code for that. Write the path with forward slashes, e.g. C:/Users/kyleh/agent-farm - never backslashes")
         elif t == "write_file":
             tool_info.append("write_file (arg: path) - write to file (content separate)")
         elif t == "http_get":
@@ -169,7 +169,7 @@ def build_structured_prompt(role: str, task: str, context: str = "") -> str:
     # Tell it the working directory, which is the repo root when
     # the server runs from the repo, and to use it as the base
     # for list_dir, read_file, and search_code.
-    workdir_line = f"\nWORKING DIRECTORY: {os.getcwd()} - use this as the base path for list_dir, read_file, and search_code. Do not invent paths."
+    workdir_line = f"\nWORKING DIRECTORY: {os.getcwd().replace(chr(92), '/')} - use this as the base path for list_dir, read_file, and search_code. Do not invent paths."
 
     return f"""You are a {role} bug. Pick ONE tool to call for this task.
 {workdir_line}
@@ -185,6 +185,13 @@ COMMON PATTERNS:
 - Run command -> exec_cmd with the command
 - Read file -> read_file with path
 - List folder -> list_dir with path
+
+PATHS: Always write Windows paths with forward slashes, e.g. C:/Users/kyleh/agent-farm - never backslashes, never a trailing slash. Backslashes break JSON and produce paths Windows rejects.
+
+EXAMPLES:
+- TASK: "List the Python files in the agent_farm folder" -> list_dir with C:/Users/kyleh/agent-farm/agent_farm (list_dir first - search_code searches INSIDE files, it cannot list them)
+- TASK: "Where is the synthesizer model named?" -> search_code with pattern synthesizer (the text is known, so search inside files)
+- If a tool returns no results or an error, do NOT answer "no results found". Try a different tool or different arguments first - the tool, the pattern, or the path may be wrong, not the answer.
 {context_line}
 TASK: {task}
 
@@ -293,10 +300,38 @@ ANSWER:"""
 
 # ============ RESULT PROCESSING ============
 
+def _is_empty_result(result: Dict) -> bool:
+    """True when a tool result carries no usable information.
+
+    An empty result is not an answer: search_code with 0 matches,
+    list_dir with 0 items, an error, or empty stdout all mean the
+    agent tried the wrong tool, the wrong arguments, or the wrong
+    path -- not that nothing exists. The loop retries a different
+    tool instead of forcing an answer from this.
+    """
+    if not isinstance(result, dict):
+        return True
+    if "error" in result:
+        return True
+    if "total_matches" in result:
+        return result.get("total_matches", 0) == 0
+    if "items" in result:
+        return result.get("count", len(result.get("items", []))) == 0
+    if "stdout" in result:
+        return not result.get("stdout", "").strip()
+    if "content" in result:
+        return not result.get("content", "").strip()
+    return False
+
+
 def _summarize_result(result: Dict) -> str:
     """Summarize a tool result for history"""
     if "error" in result:
         return f"Error: {result['error']}"
+    if "total_matches" in result and result.get("total_matches", 0) == 0:
+        return "EMPTY: 0 matches - this does NOT prove nothing exists, the pattern, folder, or tool may be wrong"
+    if "items" in result and result.get("count", len(result.get("items", []))) == 0:
+        return "EMPTY: 0 items - this does NOT prove the folder is empty, the path or tool may be wrong"
     if "stdout" in result:
         out = result.get('stdout', '')[:200]
         return out if out else "(no output)"
@@ -565,12 +600,46 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
                         "result": tool_result
                     })
                     
-                    # Check for error
-                    if isinstance(tool_result, dict) and "error" in tool_result:
-                        # Continue to next iteration with error context
-                        context = f"Previous tool error: {tool_result['error']}. Try different approach."
-                        continue
                     
+                    # Empty result (or error): do NOT force an answer
+                    # from nothing. Nudge the model to try a different
+                    # tool (or different arguments) and keep looping
+                    # while iterations remain. An empty result proves
+                    # nothing. On the last iteration, fall through to
+                    # the forced-answer path below instead of looping
+                    # past the end.
+                    if _is_empty_result(tool_result) and iteration < MAX_TOOL_ITERATIONS:
+                        tried = {h["tool"] for h in tool_history}
+                        untried = [t for t in get_tools_for_role(role) if t not in tried]
+                        why = ""
+                        if isinstance(tool_result, dict) and "error" in tool_result:
+                            why = " Error: " + str(tool_result["error"]) + "."
+                        context = (
+                            "That tool returned no results." + why + " This "
+                            "does NOT prove nothing exists - the tool, the "
+                            "arguments, or the path may be wrong. Try a "
+                            "different tool or different arguments. You have "
+                            "not yet tried: " + ", ".join(untried) + ". Do not "
+                            "answer 'no results found' until you have tried "
+                            "at least two different tools."
+                        )
+                        continue
+
+                    # Anti-repeat: the same tool with the same arguments
+                    # three times means the model is stuck - tell it so
+                    # instead of letting it burn the remaining iterations.
+                    same_calls = [
+                        h for h in tool_history
+                        if h["tool"] == tool_name and h.get("args", {}) == kwargs
+                    ]
+                    if len(same_calls) >= 3 and iteration < MAX_TOOL_ITERATIONS:
+                        context = (
+                            "You have called " + tool_name + " with the same "
+                            "arguments three times. Stop repeating it - try a "
+                            "different tool or different arguments."
+                        )
+                        continue
+
                     # Auto-format simple results
                     auto_answer = format_result_simple(tool_result)
                     if auto_answer and not deep:
