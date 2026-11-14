@@ -610,7 +610,10 @@ def test_structured_prompt_names_search_code_and_workdir(monkeypatch, tmp_path):
     prompt = build_structured_prompt("scout", "search the repo for colony_type_pick")
     assert "search_code" in prompt
     assert "grep does not exist on Windows" in prompt
-    assert f"WORKING DIRECTORY: {os.getcwd()}" in prompt
+    # The workdir line is forward-slashed now (the model copies the
+    # form it sees, and backslashes break JSON): compare against the
+    # slashed form on every OS.
+    assert "WORKING DIRECTORY: " + os.getcwd().replace("\\", "/") in prompt
     assert "Do not invent paths" in prompt
 
 
