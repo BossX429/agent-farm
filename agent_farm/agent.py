@@ -7,6 +7,7 @@ Agent Farm v3.4 - Structured Output Edition
 """
 
 import json
+import os
 import re
 import time
 import httpx
@@ -143,6 +144,8 @@ def build_structured_prompt(role: str, task: str, context: str = "") -> str:
             tool_info.append("check_service (arg: service name) - check if service running")
         elif t == "exec_cmd":
             tool_info.append("exec_cmd (arg: shell command) - run any shell command")
+        elif t == "search_code":
+            tool_info.append("search_code (arg: pattern) - search file contents for a pattern, in the working directory")
         elif t == "read_file":
             tool_info.append("read_file (arg: file path) - read file contents")
         elif t == "list_dir":
@@ -161,9 +164,15 @@ def build_structured_prompt(role: str, task: str, context: str = "") -> str:
     tools_desc = "\n".join(f"  - {t}" for t in tool_info)
     
     context_line = f"\nCONTEXT: {context}" if context else ""
-    
-    return f"""You are a {role} bug. Pick ONE tool to call for this task.
+    # The model cannot see where it is: the PR #30 live proof
+    # had it list a hallucinated placeholder path five times.
+    # Tell it the working directory, which is the repo root when
+    # the server runs from the repo, and to use it as the base
+    # for list_dir, read_file, and search_code.
+    workdir_line = f"\nWORKING DIRECTORY: {os.getcwd()} - use this as the base path for list_dir, read_file, and search_code. Do not invent paths."
 
+    return f"""You are a {role} bug. Pick ONE tool to call for this task.
+{workdir_line}
 AVAILABLE TOOLS:
 {tools_desc}
 
@@ -172,6 +181,7 @@ COMMON PATTERNS:
 - Check service -> check_service with service name
 - Disk space -> disk_usage with path (/)
 - Top processes -> process_list with "cpu" or "memory"
+- Search file contents -> search_code with the pattern (use this, not grep: grep does not exist on Windows)
 - Run command -> exec_cmd with the command
 - Read file -> read_file with path
 - List folder -> list_dir with path
@@ -219,17 +229,18 @@ def build_agent_prompt(role: str, task: str, context: str = "", deep: bool = Fal
 DEEP WORK MODE - You may need MULTIPLE tool calls to complete this task.
 After each tool result, decide: Do I have enough info to answer? If NO, call another tool.
 
-IMPORTANT - WHEN TO USE exec_cmd vs list_dir:
+IMPORTANT - WHEN TO USE exec_cmd vs the native tools:
 - list_dir: ONLY for seeing what files exist in a directory
-- exec_cmd: For EVERYTHING ELSE including:
-  * Finding file sizes: exec_cmd(du -sh /path)
-  * Counting files: exec_cmd(find /path -name "*.py" | wc -l)
-  * Finding large files: exec_cmd(find /path -size +10M)
-  * Searching content: exec_cmd(grep -r "pattern" /path)
-  * Getting disk usage: exec_cmd(df -h)
-  * Complex queries: exec_cmd(find /path -name "__pycache__" -exec du -sh {} \\;)
+- search_code: for searching file contents (use this, NOT grep:
+  grep, find, du, and df do not exist on Windows, and exec_cmd
+  runs with no shell, so those commands always fail)
+- disk_usage: for disk space (use this, NOT df -h)
+- exec_cmd: only for commands that exist on this machine.
+  Bare `git` is resolved to the direct binary when AGENT_FARM_GIT
+  is set; otherwise use the full path to the binary.
 
-When task asks for sizes, counts, or analysis - USE exec_cmd with shell commands!
+When a task asks for sizes, counts, or analysis, use the native
+tool above first and exec_cmd only for what it cannot do.
 """
 
     return f"""You are a {role} bug. You MUST call tools to get real data. Do NOT make up answers.
@@ -239,7 +250,7 @@ TOOLS:
 {deep_instructions}
 QUICK REFERENCE:
 - System stats -> system_status()
-- Disk space -> disk_usage(/) or exec_cmd(df -h)
+- Disk space -> disk_usage(/)
 - Service check -> check_service(name)
 - Top processes -> process_list(cpu)
 - Shell command -> exec_cmd(command)  <-- USE THIS FOR COMPLEX QUERIES
@@ -405,6 +416,7 @@ def parse_structured_response(response: Dict, role: str) -> tuple:
         'check_service': 'name', 'http_get': 'url', 'http_post': 'url',
         'kmkb_search': 'query', 'kmkb_ask': 'question',
         'process_list': 'sort_by', 'analyze_code': 'code',
+        'search_code': 'pattern',
     }
     
     kwargs = {}
@@ -429,6 +441,7 @@ def parse_tool_call_regex(response: str) -> tuple:
         'check_service': 'name', 'http_get': 'url', 'http_post': 'url',
         'kmkb_search': 'query', 'kmkb_ask': 'question',
         'process_list': 'sort_by', 'analyze_code': 'code',
+        'search_code': 'pattern',
     }
     
     # Try JSON first (model might output JSON even without schema enforcement)

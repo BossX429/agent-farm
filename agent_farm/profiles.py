@@ -71,7 +71,7 @@ TASK_TYPE_KEYWORDS = {
         "memory",
     ),
     "check": (
-        ["monitor", "health check", "system status", "check service"],
+        ["monitor", "health check", "system status", "check service", "check"],
         "guardian",
     ),
     "list": (["list", "find", "explore", "scan", "read file", "check if"], "scout"),

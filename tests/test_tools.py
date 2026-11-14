@@ -216,3 +216,57 @@ def test_unique_ids_do_not_collide():
     ids = {_unique_id("colony") for _ in range(1000)}
     assert len(ids) == 1000
     assert all(i.startswith("colony-") for i in ids)
+
+
+# ---------- search_code (native search, no grep) ----------
+
+def test_search_code_finds_pattern(tmp_path):
+    (tmp_path / "a.py").write_text("def add(a, b):\n    return a + b\n")
+    (tmp_path / "b.py").write_text("def sub(a, b):\n    return a - b\n")
+    result = tools.tool_search_code("def add", path=str(tmp_path))
+    assert result["total_matches"] == 1
+    assert result["matches"][0]["file"].endswith("a.py")
+    assert result["matches"][0]["line"] == 1
+    assert "def add" in result["matches"][0]["text"]
+    assert result["files_searched"] == 2
+
+
+def test_search_code_respects_file_pattern(tmp_path):
+    (tmp_path / "a.py").write_text("needle here\n")
+    (tmp_path / "a.txt").write_text("needle here\n")
+    result = tools.tool_search_code("needle", path=str(tmp_path), file_pattern="*.py")
+    assert result["total_matches"] == 1
+    assert result["matches"][0]["file"].endswith("a.py")
+
+
+def test_search_code_invalid_regex_falls_back_to_substring(tmp_path):
+    (tmp_path / "a.py").write_text("price is [100] dollars\n")
+    result = tools.tool_search_code("[100]", path=str(tmp_path))
+    assert result["total_matches"] == 1
+
+
+def test_search_code_missing_directory():
+    result = tools.tool_search_code("x", path="/no/such/dir/af_xyz")
+    assert "error" in result
+
+
+def test_search_code_skips_pycache(tmp_path):
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    (cache / "a.py").write_text("needle here\n")
+    (tmp_path / "a.py").write_text("nothing\n")
+    result = tools.tool_search_code("needle", path=str(tmp_path))
+    assert result["total_matches"] == 0
+
+
+# ---------- git resolution in exec_cmd ----------
+
+def test_resolve_git_uses_env_path(monkeypatch):
+    monkeypatch.setenv("AGENT_FARM_GIT", "/usr/bin/git")
+    assert tools._resolve_git(["git", "branch", "-a"]) == ["/usr/bin/git", "branch", "-a"]
+
+
+def test_resolve_git_leaves_git_alone_without_env(monkeypatch):
+    monkeypatch.delenv("AGENT_FARM_GIT", raising=False)
+    assert tools._resolve_git(["git", "branch", "-a"]) == ["git", "branch", "-a"]
+    assert tools._resolve_git(["python", "-c", "x"]) == ["python", "-c", "x"]

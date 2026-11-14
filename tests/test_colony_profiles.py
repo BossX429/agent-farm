@@ -600,6 +600,20 @@ def test_tool_swarm_without_colony_type_skips_colony_card(monkeypatch):
     assert get_colony_profile("hybrid") is None
 
 
+def test_structured_prompt_names_search_code_and_workdir(monkeypatch, tmp_path):
+    # The model must be told to use search_code (not grep) and
+    # must be told where it is, or it invents placeholder paths.
+    import os
+    from agent_farm.agent import build_structured_prompt
+
+    monkeypatch.chdir(tmp_path)
+    prompt = build_structured_prompt("scout", "search the repo for colony_type_pick")
+    assert "search_code" in prompt
+    assert "grep does not exist on Windows" in prompt
+    assert f"WORKING DIRECTORY: {os.getcwd()}" in prompt
+    assert "Do not invent paths" in prompt
+
+
 def test_quick_swarm_routes_search_through_tool_path(monkeypatch):
     # The 25-test proved the plain path cannot do system-state
     # tasks: it has no tools, so the model answers UNCERTAIN.
