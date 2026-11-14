@@ -216,3 +216,83 @@ def test_unique_ids_do_not_collide():
     ids = {_unique_id("colony") for _ in range(1000)}
     assert len(ids) == 1000
     assert all(i.startswith("colony-") for i in ids)
+
+
+# ---------- search_code (native search, no grep) ----------
+
+def test_search_code_finds_pattern(tmp_path):
+    (tmp_path / "a.py").write_text("def add(a, b):\n    return a + b\n")
+    (tmp_path / "b.py").write_text("def sub(a, b):\n    return a - b\n")
+    result = tools.tool_search_code("def add", path=str(tmp_path))
+    assert result["total_matches"] == 1
+    assert result["matches"][0]["file"].endswith("a.py")
+    assert result["matches"][0]["line"] == 1
+    assert "def add" in result["matches"][0]["text"]
+    assert result["files_searched"] == 2
+
+
+def test_search_code_respects_file_pattern(tmp_path):
+    (tmp_path / "a.py").write_text("needle here\n")
+    (tmp_path / "a.txt").write_text("needle here\n")
+    result = tools.tool_search_code("needle", path=str(tmp_path), file_pattern="*.py")
+    assert result["total_matches"] == 1
+    assert result["matches"][0]["file"].endswith("a.py")
+
+
+def test_search_code_invalid_regex_falls_back_to_substring(tmp_path):
+    (tmp_path / "a.py").write_text("price is [100] dollars\n")
+    result = tools.tool_search_code("[100]", path=str(tmp_path))
+    assert result["total_matches"] == 1
+
+
+def test_search_code_missing_directory():
+    result = tools.tool_search_code("x", path="/no/such/dir/af_xyz")
+    assert "error" in result
+
+
+def test_search_code_skips_pycache(tmp_path):
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    (cache / "a.py").write_text("needle here\n")
+    (tmp_path / "a.py").write_text("nothing\n")
+    result = tools.tool_search_code("needle", path=str(tmp_path))
+    assert result["total_matches"] == 0
+
+
+# ---------- _clean_path (mangled model paths) ----------
+
+def test_clean_path_strips_trailing_quote_and_separator():
+    # The PR #30 live proof: the model wrote a Windows path ending in
+    # backslash-quote, which JSON reads as a literal trailing quote and
+    # Windows rejects with WinError 123.
+    assert tools._clean_path('C:\\Users\\kyleh\\agent-farm\\"') == "C:\\Users\\kyleh\\agent-farm"
+    assert tools._clean_path('"C:/Users/kyleh/agent-farm/"') == "C:/Users/kyleh/agent-farm"
+    assert tools._clean_path("  C:/Users/kyleh/agent-farm/  ") == "C:/Users/kyleh/agent-farm"
+
+
+def test_clean_path_keeps_drive_root():
+    assert tools._clean_path("C:\\") == "C:\\"
+    assert tools._clean_path("C:") == "C:\\"
+    assert tools._clean_path("/") == "/"
+
+
+def test_canonical_path_sanitizes_mangled_windows_path(tmp_path):
+    # A mangled path must resolve to the real directory, not error.
+    mangled = '"' + str(tmp_path) + '/"'
+    assert tools._canonical_path(mangled) == str(tmp_path)
+    result = tools.tool_list_dir(mangled)
+    assert "error" not in result
+    assert result["count"] == 0
+
+
+# ---------- git resolution in exec_cmd ----------
+
+def test_resolve_git_uses_env_path(monkeypatch):
+    monkeypatch.setenv("AGENT_FARM_GIT", "/usr/bin/git")
+    assert tools._resolve_git(["git", "branch", "-a"]) == ["/usr/bin/git", "branch", "-a"]
+
+
+def test_resolve_git_leaves_git_alone_without_env(monkeypatch):
+    monkeypatch.delenv("AGENT_FARM_GIT", raising=False)
+    assert tools._resolve_git(["git", "branch", "-a"]) == ["git", "branch", "-a"]
+    assert tools._resolve_git(["python", "-c", "x"]) == ["python", "-c", "x"]

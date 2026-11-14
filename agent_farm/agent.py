@@ -7,6 +7,7 @@ Agent Farm v3.4 - Structured Output Edition
 """
 
 import json
+import os
 import re
 import time
 import httpx
@@ -138,15 +139,17 @@ def build_structured_prompt(role: str, task: str, context: str = "") -> str:
         elif t == "process_list":
             tool_info.append("process_list (arg: cpu or memory) - list top processes")
         elif t == "disk_usage":
-            tool_info.append("disk_usage (arg: path like /) - check disk space")
+            tool_info.append("disk_usage (arg: path like /) - check disk space. Write the path with forward slashes, e.g. C:/Users/kyleh/agent-farm - never backslashes")
         elif t == "check_service":
             tool_info.append("check_service (arg: service name) - check if service running")
         elif t == "exec_cmd":
             tool_info.append("exec_cmd (arg: shell command) - run any shell command")
+        elif t == "search_code":
+            tool_info.append("search_code (arg: pattern) - search INSIDE files for a text pattern, in the working directory. USE WHEN you know the text to find. DO NOT USE to discover what files exist - use list_dir first")
         elif t == "read_file":
             tool_info.append("read_file (arg: file path) - read file contents")
         elif t == "list_dir":
-            tool_info.append("list_dir (arg: directory path) - list directory contents")
+            tool_info.append("list_dir (arg: directory path) - list the files in a directory. USE WHEN you need to discover what files exist. DO NOT USE to search inside files - use search_code for that. Write the path with forward slashes, e.g. C:/Users/kyleh/agent-farm - never backslashes")
         elif t == "write_file":
             tool_info.append("write_file (arg: path) - write to file (content separate)")
         elif t == "http_get":
@@ -161,9 +164,15 @@ def build_structured_prompt(role: str, task: str, context: str = "") -> str:
     tools_desc = "\n".join(f"  - {t}" for t in tool_info)
     
     context_line = f"\nCONTEXT: {context}" if context else ""
-    
-    return f"""You are a {role} bug. Pick ONE tool to call for this task.
+    # The model cannot see where it is: the PR #30 live proof
+    # had it list a hallucinated placeholder path five times.
+    # Tell it the working directory, which is the repo root when
+    # the server runs from the repo, and to use it as the base
+    # for list_dir, read_file, and search_code.
+    workdir_line = f"\nWORKING DIRECTORY: {os.getcwd().replace(chr(92), '/')} - use this as the base path for list_dir, read_file, and search_code. Do not invent paths."
 
+    return f"""You are a {role} bug. Pick ONE tool to call for this task.
+{workdir_line}
 AVAILABLE TOOLS:
 {tools_desc}
 
@@ -172,9 +181,18 @@ COMMON PATTERNS:
 - Check service -> check_service with service name
 - Disk space -> disk_usage with path (/)
 - Top processes -> process_list with "cpu" or "memory"
+- Search file contents -> search_code with the pattern (use this, not grep: grep does not exist on Windows)
 - Run command -> exec_cmd with the command
 - Read file -> read_file with path
 - List folder -> list_dir with path
+
+PATHS: Always write Windows paths with forward slashes, e.g. C:/Users/kyleh/agent-farm - never backslashes, never a trailing slash. Backslashes break JSON and produce paths Windows rejects.
+
+EXAMPLES:
+- TASK: "List the Python files in the agent_farm folder" -> list_dir with C:/Users/kyleh/agent-farm/agent_farm (list_dir first - search_code searches INSIDE files, it cannot list them)
+- TASK: "Where is the synthesizer model named?" -> search_code with pattern synthesizer (the text is known, so search inside files)
+- TASK: "List the colony types agent-farm supports" -> search_code with pattern COLONY_TYPES (the types are defined in code, not in a folder - search for the constant name in capitals, then read the file it is in)
+- If a tool returns no results or an error, do NOT answer "no results found". Try a different tool or different arguments first - the tool, the pattern, or the path may be wrong, not the answer.
 {context_line}
 TASK: {task}
 
@@ -219,17 +237,18 @@ def build_agent_prompt(role: str, task: str, context: str = "", deep: bool = Fal
 DEEP WORK MODE - You may need MULTIPLE tool calls to complete this task.
 After each tool result, decide: Do I have enough info to answer? If NO, call another tool.
 
-IMPORTANT - WHEN TO USE exec_cmd vs list_dir:
+IMPORTANT - WHEN TO USE exec_cmd vs the native tools:
 - list_dir: ONLY for seeing what files exist in a directory
-- exec_cmd: For EVERYTHING ELSE including:
-  * Finding file sizes: exec_cmd(du -sh /path)
-  * Counting files: exec_cmd(find /path -name "*.py" | wc -l)
-  * Finding large files: exec_cmd(find /path -size +10M)
-  * Searching content: exec_cmd(grep -r "pattern" /path)
-  * Getting disk usage: exec_cmd(df -h)
-  * Complex queries: exec_cmd(find /path -name "__pycache__" -exec du -sh {} \\;)
+- search_code: for searching file contents (use this, NOT grep:
+  grep, find, du, and df do not exist on Windows, and exec_cmd
+  runs with no shell, so those commands always fail)
+- disk_usage: for disk space (use this, NOT df -h)
+- exec_cmd: only for commands that exist on this machine.
+  Bare `git` is resolved to the direct binary when AGENT_FARM_GIT
+  is set; otherwise use the full path to the binary.
 
-When task asks for sizes, counts, or analysis - USE exec_cmd with shell commands!
+When a task asks for sizes, counts, or analysis, use the native
+tool above first and exec_cmd only for what it cannot do.
 """
 
     return f"""You are a {role} bug. You MUST call tools to get real data. Do NOT make up answers.
@@ -239,7 +258,7 @@ TOOLS:
 {deep_instructions}
 QUICK REFERENCE:
 - System stats -> system_status()
-- Disk space -> disk_usage(/) or exec_cmd(df -h)
+- Disk space -> disk_usage(/)
 - Service check -> check_service(name)
 - Top processes -> process_list(cpu)
 - Shell command -> exec_cmd(command)  <-- USE THIS FOR COMPLEX QUERIES
@@ -282,10 +301,38 @@ ANSWER:"""
 
 # ============ RESULT PROCESSING ============
 
+def _is_empty_result(result: Dict) -> bool:
+    """True when a tool result carries no usable information.
+
+    An empty result is not an answer: search_code with 0 matches,
+    list_dir with 0 items, an error, or empty stdout all mean the
+    agent tried the wrong tool, the wrong arguments, or the wrong
+    path -- not that nothing exists. The loop retries a different
+    tool instead of forcing an answer from this.
+    """
+    if not isinstance(result, dict):
+        return True
+    if "error" in result:
+        return True
+    if "total_matches" in result:
+        return result.get("total_matches", 0) == 0
+    if "items" in result:
+        return result.get("count", len(result.get("items", []))) == 0
+    if "stdout" in result:
+        return not result.get("stdout", "").strip()
+    if "content" in result:
+        return not result.get("content", "").strip()
+    return False
+
+
 def _summarize_result(result: Dict) -> str:
     """Summarize a tool result for history"""
     if "error" in result:
         return f"Error: {result['error']}"
+    if "total_matches" in result and result.get("total_matches", 0) == 0:
+        return "EMPTY: 0 matches - this does NOT prove nothing exists, the pattern, folder, or tool may be wrong"
+    if "items" in result and result.get("count", len(result.get("items", []))) == 0:
+        return "EMPTY: 0 items - this does NOT prove the folder is empty, the path or tool may be wrong"
     if "stdout" in result:
         out = result.get('stdout', '')[:200]
         return out if out else "(no output)"
@@ -405,6 +452,7 @@ def parse_structured_response(response: Dict, role: str) -> tuple:
         'check_service': 'name', 'http_get': 'url', 'http_post': 'url',
         'kmkb_search': 'query', 'kmkb_ask': 'question',
         'process_list': 'sort_by', 'analyze_code': 'code',
+        'search_code': 'pattern',
     }
     
     kwargs = {}
@@ -429,6 +477,7 @@ def parse_tool_call_regex(response: str) -> tuple:
         'check_service': 'name', 'http_get': 'url', 'http_post': 'url',
         'kmkb_search': 'query', 'kmkb_ask': 'question',
         'process_list': 'sort_by', 'analyze_code': 'code',
+        'search_code': 'pattern',
     }
     
     # Try JSON first (model might output JSON even without schema enforcement)
@@ -533,6 +582,25 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
                 
                 # Got an answer?
                 if tool_name is None and isinstance(result, str) and result:
+                    # Completion guard: a tool agent must not answer
+                    # from nothing. If no tool has returned usable
+                    # data yet, the answer is a guess - nudge it to
+                    # call a tool instead. On the last iteration the
+                    # answer is accepted so the loop terminates.
+                    has_data = any(
+                        not _is_empty_result(h["result"])
+                        for h in tool_history
+                    )
+                    if not has_data and iteration < MAX_TOOL_ITERATIONS:
+                        tried = {h["tool"] for h in tool_history}
+                        untried = [t for t in get_tools_for_role(role) if t not in tried]
+                        context = (
+                            "You have not found anything yet - you "
+                            "cannot answer without tool data. Call a "
+                            "tool. You have not yet tried: "
+                            + ", ".join(untried) + "."
+                        )
+                        continue
                     return {
                         "answer": clean_answer(result),
                         "tool_calls": tool_history,
@@ -552,12 +620,46 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
                         "result": tool_result
                     })
                     
-                    # Check for error
-                    if isinstance(tool_result, dict) and "error" in tool_result:
-                        # Continue to next iteration with error context
-                        context = f"Previous tool error: {tool_result['error']}. Try different approach."
-                        continue
                     
+                    # Empty result (or error): do NOT force an answer
+                    # from nothing. Nudge the model to try a different
+                    # tool (or different arguments) and keep looping
+                    # while iterations remain. An empty result proves
+                    # nothing. On the last iteration, fall through to
+                    # the forced-answer path below instead of looping
+                    # past the end.
+                    if _is_empty_result(tool_result) and iteration < MAX_TOOL_ITERATIONS:
+                        tried = {h["tool"] for h in tool_history}
+                        untried = [t for t in get_tools_for_role(role) if t not in tried]
+                        why = ""
+                        if isinstance(tool_result, dict) and "error" in tool_result:
+                            why = " Error: " + str(tool_result["error"]) + "."
+                        context = (
+                            "That tool returned no results." + why + " This "
+                            "does NOT prove nothing exists - the tool, the "
+                            "arguments, or the path may be wrong. Try a "
+                            "different tool or different arguments. You have "
+                            "not yet tried: " + ", ".join(untried) + ". Do not "
+                            "answer 'no results found' until you have tried "
+                            "at least two different tools."
+                        )
+                        continue
+
+                    # Anti-repeat: the same tool with the same arguments
+                    # three times means the model is stuck - tell it so
+                    # instead of letting it burn the remaining iterations.
+                    same_calls = [
+                        h for h in tool_history
+                        if h["tool"] == tool_name and h.get("args", {}) == kwargs
+                    ]
+                    if len(same_calls) >= 3 and iteration < MAX_TOOL_ITERATIONS:
+                        context = (
+                            "You have called " + tool_name + " with the same "
+                            "arguments three times. Stop repeating it - try a "
+                            "different tool or different arguments."
+                        )
+                        continue
+
                     # Auto-format simple results
                     auto_answer = format_result_simple(tool_result)
                     if auto_answer and not deep:

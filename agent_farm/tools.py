@@ -36,11 +36,11 @@ from dataclasses import dataclass
 # Role-specific tool permissions
 # All roles get core system tools to ensure they can answer system questions
 ROLE_TOOLS = {
-    "scout": ["read_file", "list_dir", "file_exists", "system_status", "process_list", "disk_usage", "check_service", "exec_cmd"],
-    "worker": ["read_file", "write_file", "list_dir", "exec_cmd", "http_get", "http_post", "system_status", "disk_usage", "check_service"],
-    "memory": ["read_file", "kmkb_search", "kmkb_ask", "list_dir", "system_status", "process_list", "disk_usage", "check_service", "exec_cmd"],
-    "guardian": ["system_status", "process_list", "disk_usage", "check_service", "read_file", "list_dir", "exec_cmd"],
-    "learner": ["read_file", "analyze_code", "list_dir", "kmkb_search", "system_status", "process_list", "disk_usage", "check_service", "exec_cmd"],
+    "scout": ["read_file", "list_dir", "file_exists", "system_status", "process_list", "disk_usage", "check_service", "exec_cmd", "search_code"],
+    "worker": ["read_file", "write_file", "list_dir", "exec_cmd", "search_code", "http_get", "http_post", "system_status", "disk_usage", "check_service"],
+    "memory": ["read_file", "kmkb_search", "kmkb_ask", "list_dir", "system_status", "process_list", "disk_usage", "check_service", "exec_cmd", "search_code"],
+    "guardian": ["system_status", "process_list", "disk_usage", "check_service", "read_file", "list_dir", "exec_cmd", "search_code"],
+    "learner": ["read_file", "analyze_code", "list_dir", "kmkb_search", "system_status", "process_list", "disk_usage", "check_service", "exec_cmd", "search_code"],
 }
 
 # Safety limits
@@ -153,6 +153,30 @@ BLOCKED_COMMANDS = [
 ]
 
 
+def _clean_path(raw: str) -> str:
+    """Strip model-mangled characters off a path before canonicalizing.
+
+    A model writing a Windows path as JSON can end it with a literal
+    quote: a trailing backslash before the closing quote is read as
+    an escaped quote, so the path gains a trailing '"' and Windows
+    rejects it with WinError 123. Strip surrounding whitespace and
+    quotes and trailing separators (but keep a drive root like C:\
+    intact), so a mangled path still resolves instead of erroring.
+    """
+    s = str(raw).strip().strip('"').strip("'").strip()
+    # Trailing separators: keep a drive root ("C:" / "C:\") and the
+    # filesystem root ("/") intact, strip them everywhere else.
+    while len(s) > 1 and s[-1] in ("\\", "/"):
+        if len(s) == 2 and s[1] == ":":
+            break
+        if len(s) == 3 and s[1] == ":" and s[2] in ("\\", "/"):
+            break
+        s = s[:-1]
+    if len(s) == 2 and s[1] == ":":
+        s += "\\"
+    return s
+
+
 def _canonical_path(path: str) -> str:
     """Expand ~ / env vars and resolve symlinks and '..' components.
 
@@ -160,7 +184,7 @@ def _canonical_path(path: str) -> str:
     directory that is a symlink) even when the final file does not exist
     yet, which is exactly what write-path checks need.
     """
-    return os.path.realpath(expand_path(path))
+    return os.path.realpath(expand_path(_clean_path(path)))
 
 
 def _is_within(path: str, directory: str) -> bool:
@@ -752,12 +776,102 @@ def tool_list_dir(path: str) -> Dict:
         return {"error": str(e)}
 
 
+def tool_search_code(pattern: str, path: str = ".", file_pattern: str = "*.py") -> Dict:
+    """Search file contents for a pattern, in Python, on any OS.
+
+    The tool descriptions used to tell the model to run
+    `grep -r` through exec_cmd, but grep does not exist on
+    Windows and exec_cmd runs with no shell, so every search
+    came back "no results found" (the PR #30 live proof).
+    This walks the directory itself: no shell, no grep, no
+    platform-specific binary. The pattern is a regex; if it
+    does not compile, it is treated as a plain substring.
+    Skips .git, __pycache__, .venv and node_modules, reads
+    text as UTF-8 with replacement characters, and caps the
+    matches so one broad pattern cannot flood the model.
+    """
+    import fnmatch
+
+    if not pattern:
+        return {"error": "Empty search pattern"}
+    try:
+        matcher = re.compile(pattern)
+    except re.error:
+        matcher = re.compile(re.escape(pattern))
+    search_root = _canonical_path(path)
+    if not is_path_safe(search_root):
+        return {"error": f"Blocked path: {search_root}"}
+    if not os.path.isdir(search_root):
+        return {"error": f"Not a directory: {search_root}"}
+    skip_dirs = {"__pycache__", ".git", ".venv", "node_modules", ".hg", ".svn"}
+    max_files = 500
+    matches = []
+    files_searched = 0
+    truncated = False
+    for root, dirs, files in os.walk(search_root):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for name in sorted(files):
+            if not fnmatch.fnmatch(name, file_pattern):
+                continue
+            if files_searched >= max_files:
+                truncated = True
+                break
+            file_path = os.path.join(root, name)
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except (OSError, UnicodeError):
+                continue
+            files_searched += 1
+            for line_no, line in enumerate(lines, start=1):
+                if matcher.search(line):
+                    if len(matches) >= 20:
+                        truncated = True
+                        break
+                    matches.append({
+                        "file": file_path,
+                        "line": line_no,
+                        "text": line.strip()[:200],
+                    })
+            if truncated:
+                break
+        if truncated:
+            break
+    return {
+        "pattern": pattern,
+        "path": search_root,
+        "matches": matches,
+        "files_searched": files_searched,
+        "total_matches": len(matches),
+        "truncated": truncated,
+    }
+
+
 def tool_file_exists(path: str) -> Dict:
     """Check if file exists (blocked paths are not probed)."""
     path = _canonical_path(path)
     if not is_path_safe(path):
         return {"path": path, "error": f"Blocked path: {path}"}
     return {"path": path, "exists": os.path.exists(path)}
+
+
+def _resolve_git(argv: List[str]) -> List[str]:
+    """Swap a bare `git` for the direct binary when one is set.
+
+    Bare `git` is a scoop shim on the PC and cannot spawn from
+    a Python subprocess ("could not determine if the target is
+    a GUI app"), so a model that runs `git branch -a` through
+    exec_cmd always fails (the PR #30 live proof). pr_review
+    already reads AGENT_FARM_GIT for the same reason; exec_cmd
+    does the same here. The swap happens on the split argument
+    list, after shlex.split, so backslashes in the direct path
+    survive. On Linux the variable is unset and nothing changes.
+    """
+    if argv and argv[0] == "git":
+        direct = os.environ.get("AGENT_FARM_GIT")
+        if direct:
+            return [direct] + argv[1:]
+    return argv
 
 
 def tool_exec_cmd(cmd: str) -> Dict:
@@ -790,7 +904,7 @@ def tool_exec_cmd(cmd: str) -> Dict:
     try:
         if _is_simple_command(cmd):
             result = subprocess.run(
-                shlex.split(cmd), shell=False, capture_output=True,
+                _resolve_git(shlex.split(cmd)), shell=False, capture_output=True,
                 text=True, timeout=EXEC_TIMEOUT
             )
             return {
@@ -801,7 +915,7 @@ def tool_exec_cmd(cmd: str) -> Dict:
             }
         stages = _parse_safe_pipeline(cmd)
         if stages is not None:
-            result = _run_pipeline(stages)
+            result = _run_pipeline([_resolve_git(s) for s in stages])
             if "error" in result:
                 return {"error": result["error"]}
             return {
@@ -973,6 +1087,7 @@ TOOL_REGISTRY: Dict[str, Callable] = {
     "kmkb_search": tool_kmkb_search,
     "kmkb_ask": tool_kmkb_ask,
     "analyze_code": tool_analyze_code,
+    "search_code": tool_search_code,
 }
 
 # Tool descriptions for the LLM
@@ -991,6 +1106,7 @@ TOOL_DESCRIPTIONS = {
     "kmkb_search": "kmkb_search(query) - Search knowledge base",
     "kmkb_ask": "kmkb_ask(question) - Ask knowledge base a question",
     "analyze_code": "analyze_code(code) - Basic code structure analysis",
+    "search_code": "search_code(pattern) - Search file contents for a pattern in the working directory (no grep needed)",
 }
 
 

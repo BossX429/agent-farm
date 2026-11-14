@@ -600,6 +600,251 @@ def test_tool_swarm_without_colony_type_skips_colony_card(monkeypatch):
     assert get_colony_profile("hybrid") is None
 
 
+def test_structured_prompt_names_search_code_and_workdir(monkeypatch, tmp_path):
+    # The model must be told to use search_code (not grep) and
+    # must be told where it is, or it invents placeholder paths.
+    import os
+    from agent_farm.agent import build_structured_prompt
+
+    monkeypatch.chdir(tmp_path)
+    prompt = build_structured_prompt("scout", "search the repo for colony_type_pick")
+    assert "search_code" in prompt
+    assert "grep does not exist on Windows" in prompt
+    # The workdir line is forward-slashed now (the model copies the
+    # form it sees, and backslashes break JSON): compare against the
+    # slashed form on every OS.
+    assert "WORKING DIRECTORY: " + os.getcwd().replace("\\", "/") in prompt
+    assert "Do not invent paths" in prompt
+
+
+def test_structured_prompt_has_forward_slash_rule_and_examples(monkeypatch, tmp_path):
+    # Web research for the 3 remaining 25-test failures: the model
+    # mangles Windows paths in JSON (trailing backslash becomes an
+    # escaped quote) and picks search_code when it should list a
+    # directory. The prompt must show forward slashes, the
+    # list_dir-before-search_code pair, and the retry-on-empty rule.
+    import os
+    from agent_farm.agent import build_structured_prompt
+
+    monkeypatch.chdir(tmp_path)
+    prompt = build_structured_prompt("scout", "list the Python files")
+    assert "forward slashes" in prompt
+    assert "C:/Users/kyleh/agent-farm" in prompt
+    assert "DO NOT USE to discover what files exist" in prompt
+    assert "DO NOT USE to search inside files" in prompt
+    assert 'do NOT answer "no results found"' in prompt
+    # The few-shot examples themselves (not just the descriptions):
+    # the list-vs-search pair and the search example must be present.
+    assert 'TASK: "List the Python files in the agent_farm folder" -> list_dir' in prompt
+    assert 'TASK: "Where is the synthesizer model named?" -> search_code' in prompt
+    assert 'TASK: "List the colony types agent-farm supports" -> search_code with pattern COLONY_TYPES' in prompt
+    assert "WORKING DIRECTORY: " + os.getcwd().replace("\\", "/") in prompt
+
+
+def test_tool_agent_refuses_answer_without_tool_data(monkeypatch):
+    # The task-25 failure: the model got an empty result, then
+    # answered "no results found" as bare text instead of trying
+    # another tool. The loop must not accept an answer until at
+    # least one tool call has returned non-empty data.
+    import agent_farm.agent as agent_module
+
+    calls = {"n": 0}
+
+    def fake_query(model, prompt, schema):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"tool": "search_code", "arg": "colony types"}
+        if calls["n"] == 2:
+            return {"action": "answer", "answer": "no results found"}
+        return {"tool": "search_code", "arg": "COLONY_TYPES"}
+
+    def fake_execute(tool_name, role, **kwargs):
+        if kwargs.get("pattern") == "COLONY_TYPES":
+            return {"total_matches": 1, "matches": [{"file": "colony_profiles.py", "line": 1, "text": "COLONY_TYPES = {...}"}], "files_searched": 1}
+        return {"total_matches": 0, "matches": [], "files_searched": 1}
+
+    monkeypatch.setattr(agent_module, "query_ollama_structured", fake_query)
+    monkeypatch.setattr(agent_module, "execute_tool", fake_execute)
+    monkeypatch.setattr(agent_module, "query_ollama_sync", lambda model, prompt: "ANSWER: standard, fast, heavy, hybrid")
+
+    result = agent_module.run_tool_agent("scout", "fake-model", "List the colony types agent-farm supports")
+    # The bare "no results found" must not be the answer: the loop
+    # kept going, found COLONY_TYPES, and answered from that data.
+    assert result["answer"] != "no results found"
+    assert len(result["tool_calls"]) >= 2
+    assert calls["n"] >= 3
+
+
+def test_tool_agent_accepts_answer_after_data(monkeypatch):
+    # Guard must not block a normal run: one non-empty tool result,
+    # then an answer, is accepted immediately.
+    import agent_farm.agent as agent_module
+
+    calls = {"n": 0}
+
+    def fake_query(model, prompt, schema):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"tool": "list_dir", "arg": "/tmp"}
+        return {"action": "answer", "answer": "a.py, b.py"}
+
+    monkeypatch.setattr(agent_module, "query_ollama_structured", fake_query)
+    monkeypatch.setattr(agent_module, "execute_tool", lambda t, r, **k: {"items": ["a.py", "b.py"], "count": 2})
+    # Quick mode forces the answer from the tool result through a
+    # freeform call: mock it, since Ollama is not reachable here.
+    monkeypatch.setattr(agent_module, "query_ollama_sync", lambda model, prompt: "ANSWER: a.py, b.py")
+
+    result = agent_module.run_tool_agent("scout", "fake-model", "List the files")
+    assert result["answer"] == "a.py, b.py"
+    # The answer came from the forced-answer path after the single
+    # tool call, so the structured model was only asked once.
+    assert calls["n"] == 1
+    assert len(result["tool_calls"]) == 1
+
+
+def test_is_empty_result_labels_empty_and_nonempty():
+    # The retry fix keys off this: an empty result must be detected
+    # so the loop tries another tool instead of forcing an answer.
+    from agent_farm.agent import _is_empty_result, _summarize_result
+
+    assert _is_empty_result({"total_matches": 0, "matches": []})
+    assert _is_empty_result({"items": [], "count": 0})
+    assert _is_empty_result({"error": "boom"})
+    assert _is_empty_result({"stdout": ""})
+    assert _is_empty_result({"content": "   "})
+    assert not _is_empty_result({"total_matches": 1, "matches": [{"file": "a.py"}]})
+    assert not _is_empty_result({"items": ["a.py"], "count": 1})
+    assert not _is_empty_result({"stdout": "hello"})
+    assert "does NOT prove nothing exists" in _summarize_result({"total_matches": 0, "matches": []})
+    assert "does NOT prove" in _summarize_result({"items": [], "count": 0})
+
+
+def test_quick_swarm_routes_search_through_tool_path(monkeypatch):
+    # The 25-test proved the plain path cannot do system-state
+    # tasks: it has no tools, so the model answers UNCERTAIN.
+    # Search, check, and list tasks must go through the tool
+    # path, where the bug gets exec_cmd and friends.
+    import agent_farm.agent as agent_module
+    import agent_farm.colony_tools as colony_tools_module
+    import agent_farm.server as server
+
+    calls = {"plain": [], "tool": []}
+
+    def _fake_plain(tasks, colony):
+        calls["plain"].extend(t["prompt"] for t in tasks)
+        return []
+
+    def _fake_tool(tasks, bugs, deep=False, colony_type=None):
+        calls["tool"].extend(t["prompt"] for t in tasks)
+        return [{
+            "bug_id": "b1", "role": "scout", "model": "m",
+            "task": "search", "answer": "found it",
+            "tool_calls": 1, "iterations": 1,
+            "status": "completed", "mode": "tool",
+            "elapsed_seconds": 0.1,
+            "profile_saved": True, "colony_profile_saved": True,
+            "profiled": True,
+        }]
+
+    monkeypatch.setattr(colony_tools_module, "execute_parallel_swarm", _fake_plain)
+    monkeypatch.setattr(agent_module, "run_tool_swarm", _fake_tool)
+    result = asyncio.run(
+        server.quick_swarm(
+            json.dumps([{"prompt": "search the repo for colony_type_pick"}]),
+            run_probes=False,
+        )
+    )
+    assert calls["tool"] == ["search the repo for colony_type_pick"]
+    assert calls["plain"] == []
+    # The tool result is shaped like a plain result.
+    assert result["results"][0]["response"] == "found it"
+    assert result["results"][0]["status"] == "success"
+    assert result["results"][0]["tool_calls"] == 1
+
+
+def test_quick_swarm_routes_write_through_plain_path(monkeypatch):
+    # Write and analyze stay on the plain path: their answer
+    # is in the prompt, and the plain path is faster.
+    import agent_farm.agent as agent_module
+    import agent_farm.colony_tools as colony_tools_module
+    import agent_farm.server as server
+
+    calls = {"plain": [], "tool": []}
+
+    def _fake_plain(tasks, colony):
+        calls["plain"].extend(t["prompt"] for t in tasks)
+        return [{
+            "bug_id": "b1", "role": "worker", "model": "m",
+            "task": "write", "response": "def add(a, b): return a + b",
+            "status": "success", "elapsed_seconds": 0.1,
+            "profiled": True,
+        }]
+
+    def _fake_tool(tasks, bugs, deep=False, colony_type=None):
+        calls["tool"].extend(t["prompt"] for t in tasks)
+        return []
+
+    monkeypatch.setattr(colony_tools_module, "execute_parallel_swarm", _fake_plain)
+    monkeypatch.setattr(agent_module, "run_tool_swarm", _fake_tool)
+    result = asyncio.run(
+        server.quick_swarm(
+            json.dumps([{"prompt": "write a function that adds two numbers"}]),
+            run_probes=False,
+        )
+    )
+    assert calls["plain"] == ["write a function that adds two numbers"]
+    assert calls["tool"] == []
+    assert result["results"][0]["response"] == "def add(a, b): return a + b"
+
+
+def test_quick_swarm_splits_mixed_tasks_by_type(monkeypatch):
+    # A mixed list splits: the search goes to the tool path,
+    # the write to the plain path, and both results come back.
+    import agent_farm.agent as agent_module
+    import agent_farm.colony_tools as colony_tools_module
+    import agent_farm.server as server
+
+    calls = {"plain": [], "tool": []}
+
+    def _fake_plain(tasks, colony):
+        calls["plain"].extend(t["prompt"] for t in tasks)
+        return [{
+            "bug_id": "b1", "role": "worker", "model": "m",
+            "task": "write", "response": "code",
+            "status": "success", "elapsed_seconds": 0.1,
+            "profiled": True,
+        }]
+
+    def _fake_tool(tasks, bugs, deep=False, colony_type=None):
+        calls["tool"].extend(t["prompt"] for t in tasks)
+        return [{
+            "bug_id": "b2", "role": "scout", "model": "m",
+            "task": "list", "answer": "a.py",
+            "tool_calls": 1, "iterations": 1,
+            "status": "completed", "mode": "tool",
+            "elapsed_seconds": 0.1,
+            "profile_saved": True, "colony_profile_saved": True,
+            "profiled": True,
+        }]
+
+    monkeypatch.setattr(colony_tools_module, "execute_parallel_swarm", _fake_plain)
+    monkeypatch.setattr(agent_module, "run_tool_swarm", _fake_tool)
+    result = asyncio.run(
+        server.quick_swarm(
+            json.dumps([
+                {"prompt": "write a function that adds two numbers"},
+                {"prompt": "list the files in the agent_farm directory"},
+            ]),
+            run_probes=False,
+        )
+    )
+    assert calls["plain"] == ["write a function that adds two numbers"]
+    assert calls["tool"] == ["list the files in the agent_farm directory"]
+    assert len(result["results"]) == 2
+    responses = sorted(r["response"] for r in result["results"])
+    assert responses == ["a.py", "code"]
+
+
 def test_quick_swarm_auto_picks_trusted_type(monkeypatch):
     import agent_farm.server as server
 
