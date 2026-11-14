@@ -191,6 +191,7 @@ PATHS: Always write Windows paths with forward slashes, e.g. C:/Users/kyleh/agen
 EXAMPLES:
 - TASK: "List the Python files in the agent_farm folder" -> list_dir with C:/Users/kyleh/agent-farm/agent_farm (list_dir first - search_code searches INSIDE files, it cannot list them)
 - TASK: "Where is the synthesizer model named?" -> search_code with pattern synthesizer (the text is known, so search inside files)
+- TASK: "List the colony types agent-farm supports" -> search_code with pattern COLONY_TYPES (the types are defined in code, not in a folder - search for the constant name in capitals, then read the file it is in)
 - If a tool returns no results or an error, do NOT answer "no results found". Try a different tool or different arguments first - the tool, the pattern, or the path may be wrong, not the answer.
 {context_line}
 TASK: {task}
@@ -581,6 +582,25 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
                 
                 # Got an answer?
                 if tool_name is None and isinstance(result, str) and result:
+                    # Completion guard: a tool agent must not answer
+                    # from nothing. If no tool has returned usable
+                    # data yet, the answer is a guess - nudge it to
+                    # call a tool instead. On the last iteration the
+                    # answer is accepted so the loop terminates.
+                    has_data = any(
+                        not _is_empty_result(h["result"])
+                        for h in tool_history
+                    )
+                    if not has_data and iteration < MAX_TOOL_ITERATIONS:
+                        tried = {h["tool"] for h in tool_history}
+                        untried = [t for t in get_tools_for_role(role) if t not in tried]
+                        context = (
+                            "You have not found anything yet - you "
+                            "cannot answer without tool data. Call a "
+                            "tool. You have not yet tried: "
+                            + ", ".join(untried) + "."
+                        )
+                        continue
                     return {
                         "answer": clean_answer(result),
                         "tool_calls": tool_history,

@@ -637,7 +637,69 @@ def test_structured_prompt_has_forward_slash_rule_and_examples(monkeypatch, tmp_
     # the list-vs-search pair and the search example must be present.
     assert 'TASK: "List the Python files in the agent_farm folder" -> list_dir' in prompt
     assert 'TASK: "Where is the synthesizer model named?" -> search_code' in prompt
+    assert 'TASK: "List the colony types agent-farm supports" -> search_code with pattern COLONY_TYPES' in prompt
     assert "WORKING DIRECTORY: " + os.getcwd().replace("\\", "/") in prompt
+
+
+def test_tool_agent_refuses_answer_without_tool_data(monkeypatch):
+    # The task-25 failure: the model got an empty result, then
+    # answered "no results found" as bare text instead of trying
+    # another tool. The loop must not accept an answer until at
+    # least one tool call has returned non-empty data.
+    import agent_farm.agent as agent_module
+
+    calls = {"n": 0}
+
+    def fake_query(model, prompt, schema):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"tool": "search_code", "arg": "colony types"}
+        if calls["n"] == 2:
+            return {"action": "answer", "answer": "no results found"}
+        return {"tool": "search_code", "arg": "COLONY_TYPES"}
+
+    def fake_execute(tool_name, role, **kwargs):
+        if kwargs.get("pattern") == "COLONY_TYPES":
+            return {"total_matches": 1, "matches": [{"file": "colony_profiles.py", "line": 1, "text": "COLONY_TYPES = {...}"}], "files_searched": 1}
+        return {"total_matches": 0, "matches": [], "files_searched": 1}
+
+    monkeypatch.setattr(agent_module, "query_ollama_structured", fake_query)
+    monkeypatch.setattr(agent_module, "execute_tool", fake_execute)
+    monkeypatch.setattr(agent_module, "query_ollama_sync", lambda model, prompt: "ANSWER: standard, fast, heavy, hybrid")
+
+    result = agent_module.run_tool_agent("scout", "fake-model", "List the colony types agent-farm supports")
+    # The bare "no results found" must not be the answer: the loop
+    # kept going, found COLONY_TYPES, and answered from that data.
+    assert result["answer"] != "no results found"
+    assert len(result["tool_calls"]) >= 2
+    assert calls["n"] >= 3
+
+
+def test_tool_agent_accepts_answer_after_data(monkeypatch):
+    # Guard must not block a normal run: one non-empty tool result,
+    # then an answer, is accepted immediately.
+    import agent_farm.agent as agent_module
+
+    calls = {"n": 0}
+
+    def fake_query(model, prompt, schema):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"tool": "list_dir", "arg": "/tmp"}
+        return {"action": "answer", "answer": "a.py, b.py"}
+
+    monkeypatch.setattr(agent_module, "query_ollama_structured", fake_query)
+    monkeypatch.setattr(agent_module, "execute_tool", lambda t, r, **k: {"items": ["a.py", "b.py"], "count": 2})
+    # Quick mode forces the answer from the tool result through a
+    # freeform call: mock it, since Ollama is not reachable here.
+    monkeypatch.setattr(agent_module, "query_ollama_sync", lambda model, prompt: "ANSWER: a.py, b.py")
+
+    result = agent_module.run_tool_agent("scout", "fake-model", "List the files")
+    assert result["answer"] == "a.py, b.py"
+    # The answer came from the forced-answer path after the single
+    # tool call, so the structured model was only asked once.
+    assert calls["n"] == 1
+    assert len(result["tool_calls"]) == 1
 
 
 def test_is_empty_result_labels_empty_and_nonempty():
