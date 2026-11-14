@@ -17,7 +17,7 @@ from .colony_profiles import (
     prune_stale_colony_profiles,
     resolve_colony_type,
 )
-from .profiles import profiles_summary, prune_stale_profiles
+from .profiles import profiles_summary, prune_stale_profiles, task_type_for_prompt
 from .state import MODEL_TIERS, OLLAMA_URL, colonies, stats
 from .colony import (
     spawn_colony_internal,
@@ -95,6 +95,72 @@ async def spawn_colony(colony_type: str = "standard", run_probes: bool = True) -
     }
 
 
+# Task types that need real system state. A plain model query
+# has no tools and no context, so for these the model can only
+# answer UNCERTAIN (the 25-test proved it: search 1/5, check
+# 3/5, list 1/5, every failure an UNCERTAIN). They go through
+# the tool path instead, where each role gets tools like
+# exec_cmd (grep for searches, df -h for disk checks) and
+# list_dir. Write and analyze stay on the plain path: their
+# answer is in the prompt, and the plain path is faster.
+TOOL_TASK_TYPES = frozenset({"search", "check", "list"})
+
+
+def _normalize_tool_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Shape a tool-swarm result like a plain-swarm result.
+
+    The tool path calls its answer "answer" and its success
+    "completed"; the plain path calls them "response" and
+    "success". Callers of quick_swarm and deploy_swarm read
+    one shape, so normalize here. The tool-only fields
+    (tool_calls, iterations, mode) are kept: they say how the
+    answer was reached.
+    """
+    out = dict(result)
+    if "answer" in out:
+        out["response"] = out.pop("answer")
+    if out.get("status") == "completed":
+        out["status"] = "success"
+    return out
+
+
+async def _run_tasks_by_type(colony, task_list: List[Dict[str, Any]], colony_type: str) -> List[Dict[str, Any]]:
+    """Run tasks through the path each type needs.
+
+    Search, check, and list tasks go through the tool path
+    (run_tool_swarm), where the bug gets tools to look at the
+    real system. Write, analyze, and anything unclassified go
+    through the plain path (execute_parallel_swarm), where the
+    answer is in the prompt. Both paths feed the profile and
+    colony cards, so routing and measurement stay consistent.
+    The two groups run one after the other, not in parallel:
+    both paths spread load over the same bugs, so running them
+    at once could assign one bug twice.
+    """
+    from .agent import run_tool_swarm
+
+    tool_tasks = []
+    plain_tasks = []
+    for task in task_list:
+        task_type = task_type_for_prompt(task.get("prompt", ""))
+        if task_type in TOOL_TASK_TYPES:
+            tool_tasks.append(task)
+        else:
+            plain_tasks.append(task)
+
+    results: List[Dict[str, Any]] = []
+    if tool_tasks:
+        tool_results = await asyncio.to_thread(
+            run_tool_swarm, tool_tasks, colony.bugs, False, colony_type
+        )
+        results.extend(_normalize_tool_result(r) for r in tool_results)
+    if plain_tasks:
+        results.extend(
+            await asyncio.to_thread(execute_parallel_swarm, plain_tasks, colony)
+        )
+    return results
+
+
 @mcp.tool()
 @track_tool_run()
 async def deploy_swarm(colony_id: str, tasks: str) -> dict:
@@ -121,8 +187,8 @@ async def deploy_swarm(colony_id: str, tasks: str) -> dict:
     if items_error:
         return {"error": items_error}
 
-    results = await asyncio.to_thread(execute_parallel_swarm, task_list, colony)
-    
+    results = await _run_tasks_by_type(colony, task_list, colony.colony_type)
+
     return {
         "colony_id": colony_id,
         "tasks_executed": len(task_list),
@@ -174,8 +240,8 @@ async def quick_swarm(tasks: str, colony_type: str = "auto", run_probes: bool = 
     if run_probes:
         probe_summary = await _probe_summary_for(colony)
 
-    results = await asyncio.to_thread(execute_parallel_swarm, task_list, colony)
-    
+    results = await _run_tasks_by_type(colony, task_list, colony_type)
+
     return {
         "colony_id": colony.id,
         "colony_type": colony_type,

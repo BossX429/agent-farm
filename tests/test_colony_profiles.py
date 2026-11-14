@@ -600,6 +600,132 @@ def test_tool_swarm_without_colony_type_skips_colony_card(monkeypatch):
     assert get_colony_profile("hybrid") is None
 
 
+def test_quick_swarm_routes_search_through_tool_path(monkeypatch):
+    # The 25-test proved the plain path cannot do system-state
+    # tasks: it has no tools, so the model answers UNCERTAIN.
+    # Search, check, and list tasks must go through the tool
+    # path, where the bug gets exec_cmd and friends.
+    import agent_farm.agent as agent_module
+    import agent_farm.colony_tools as colony_tools_module
+    import agent_farm.server as server
+
+    calls = {"plain": [], "tool": []}
+
+    def _fake_plain(tasks, colony):
+        calls["plain"].extend(t["prompt"] for t in tasks)
+        return []
+
+    def _fake_tool(tasks, bugs, deep=False, colony_type=None):
+        calls["tool"].extend(t["prompt"] for t in tasks)
+        return [{
+            "bug_id": "b1", "role": "scout", "model": "m",
+            "task": "search", "answer": "found it",
+            "tool_calls": 1, "iterations": 1,
+            "status": "completed", "mode": "tool",
+            "elapsed_seconds": 0.1,
+            "profile_saved": True, "colony_profile_saved": True,
+            "profiled": True,
+        }]
+
+    monkeypatch.setattr(colony_tools_module, "execute_parallel_swarm", _fake_plain)
+    monkeypatch.setattr(agent_module, "run_tool_swarm", _fake_tool)
+    result = asyncio.run(
+        server.quick_swarm(
+            json.dumps([{"prompt": "search the repo for colony_type_pick"}]),
+            run_probes=False,
+        )
+    )
+    assert calls["tool"] == ["search the repo for colony_type_pick"]
+    assert calls["plain"] == []
+    # The tool result is shaped like a plain result.
+    assert result["results"][0]["response"] == "found it"
+    assert result["results"][0]["status"] == "success"
+    assert result["results"][0]["tool_calls"] == 1
+
+
+def test_quick_swarm_routes_write_through_plain_path(monkeypatch):
+    # Write and analyze stay on the plain path: their answer
+    # is in the prompt, and the plain path is faster.
+    import agent_farm.agent as agent_module
+    import agent_farm.colony_tools as colony_tools_module
+    import agent_farm.server as server
+
+    calls = {"plain": [], "tool": []}
+
+    def _fake_plain(tasks, colony):
+        calls["plain"].extend(t["prompt"] for t in tasks)
+        return [{
+            "bug_id": "b1", "role": "worker", "model": "m",
+            "task": "write", "response": "def add(a, b): return a + b",
+            "status": "success", "elapsed_seconds": 0.1,
+            "profiled": True,
+        }]
+
+    def _fake_tool(tasks, bugs, deep=False, colony_type=None):
+        calls["tool"].extend(t["prompt"] for t in tasks)
+        return []
+
+    monkeypatch.setattr(colony_tools_module, "execute_parallel_swarm", _fake_plain)
+    monkeypatch.setattr(agent_module, "run_tool_swarm", _fake_tool)
+    result = asyncio.run(
+        server.quick_swarm(
+            json.dumps([{"prompt": "write a function that adds two numbers"}]),
+            run_probes=False,
+        )
+    )
+    assert calls["plain"] == ["write a function that adds two numbers"]
+    assert calls["tool"] == []
+    assert result["results"][0]["response"] == "def add(a, b): return a + b"
+
+
+def test_quick_swarm_splits_mixed_tasks_by_type(monkeypatch):
+    # A mixed list splits: the search goes to the tool path,
+    # the write to the plain path, and both results come back.
+    import agent_farm.agent as agent_module
+    import agent_farm.colony_tools as colony_tools_module
+    import agent_farm.server as server
+
+    calls = {"plain": [], "tool": []}
+
+    def _fake_plain(tasks, colony):
+        calls["plain"].extend(t["prompt"] for t in tasks)
+        return [{
+            "bug_id": "b1", "role": "worker", "model": "m",
+            "task": "write", "response": "code",
+            "status": "success", "elapsed_seconds": 0.1,
+            "profiled": True,
+        }]
+
+    def _fake_tool(tasks, bugs, deep=False, colony_type=None):
+        calls["tool"].extend(t["prompt"] for t in tasks)
+        return [{
+            "bug_id": "b2", "role": "scout", "model": "m",
+            "task": "list", "answer": "a.py",
+            "tool_calls": 1, "iterations": 1,
+            "status": "completed", "mode": "tool",
+            "elapsed_seconds": 0.1,
+            "profile_saved": True, "colony_profile_saved": True,
+            "profiled": True,
+        }]
+
+    monkeypatch.setattr(colony_tools_module, "execute_parallel_swarm", _fake_plain)
+    monkeypatch.setattr(agent_module, "run_tool_swarm", _fake_tool)
+    result = asyncio.run(
+        server.quick_swarm(
+            json.dumps([
+                {"prompt": "write a function that adds two numbers"},
+                {"prompt": "list the files in the agent_farm directory"},
+            ]),
+            run_probes=False,
+        )
+    )
+    assert calls["plain"] == ["write a function that adds two numbers"]
+    assert calls["tool"] == ["list the files in the agent_farm directory"]
+    assert len(result["results"]) == 2
+    responses = sorted(r["response"] for r in result["results"])
+    assert responses == ["a.py", "code"]
+
+
 def test_quick_swarm_auto_picks_trusted_type(monkeypatch):
     import agent_farm.server as server
 
