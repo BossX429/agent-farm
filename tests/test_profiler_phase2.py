@@ -203,6 +203,11 @@ def test_task_type_for_prompt():
     assert task_type_for_prompt("analyze code in main.py") == "analyze"
     assert task_type_for_prompt("search the knowledge base") == "search"
     assert task_type_for_prompt("check service status") == "check"
+    # Bare "Check ..." must classify as check, not general: the
+    # PR #30 live proof had both check tasks land in "general"
+    # and return UNCERTAIN from the plain path.
+    assert task_type_for_prompt("Check how much disk space is free") == "check"
+    assert task_type_for_prompt("Check whether the repo is clean") == "check"
     assert task_type_for_prompt("list files in the folder") == "list"
     assert task_type_for_prompt("do something vague") == "general"
 
