@@ -852,6 +852,99 @@ def test_tool_agent_falls_back_to_tool_data_on_last_iteration(monkeypatch):
     assert result["status"] == "completed"
 
 
+def test_task_subdir_finds_named_subdirectory(monkeypatch, tmp_path):
+    # _task_subdir matches real subdirectory names against the
+    # task text: whole-word, case-insensitive, exactly one match.
+    import os
+
+    import agent_farm.agent as agent_module
+
+    (tmp_path / "agent_farm").mkdir()
+    (tmp_path / "tests").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert agent_module._task_subdir("List the Python files in the agent_farm directory") == "agent_farm"
+    assert agent_module._task_subdir("List the files in the tests directory") == "tests"
+    assert agent_module._task_subdir("List the files in the AGENT_FARM directory") == "agent_farm"
+    assert agent_module._task_subdir("List all the files") is None
+    assert agent_module._task_subdir("List the files in the nowhere directory") is None
+    # Two named subdirectories is ambiguous: leave it alone.
+    assert agent_module._task_subdir("List the files in agent_farm and tests") is None
+    # A name inside a longer word does not match.
+    assert agent_module._task_subdir("List the files in the testing directory") is None
+
+
+def test_resolve_list_dir_path_rewrites_root_to_subdir(monkeypatch, tmp_path):
+    # A list_dir on the working dir, when the task names a
+    # subdirectory, is rewritten to that subdirectory. Anything
+    # else passes through untouched.
+    import os
+
+    import agent_farm.agent as agent_module
+
+    (tmp_path / "agent_farm").mkdir()
+    (tmp_path / "agent_farm" / "colony.py").write_text("# colony\n")
+    monkeypatch.chdir(tmp_path)
+    task = "List the Python files in the agent_farm directory"
+    root = str(tmp_path)
+    # Root, empty, and "." all mean the working dir: rewritten.
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": root}, task)["path"].replace("\\", "/").endswith("/agent_farm")
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": ""}, task)["path"].replace("\\", "/").endswith("/agent_farm")
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": "."}, task)["path"].replace("\\", "/").endswith("/agent_farm")
+    # Already the subdirectory: untouched.
+    sub = os.path.join(root, "agent_farm")
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": sub}, task)["path"] == sub
+    # A different directory: untouched.
+    other = os.path.join(root, "tests")
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": other}, task)["path"] == other
+    # Not list_dir: untouched.
+    assert agent_module._resolve_list_dir_path("search_code", {"pattern": "x"}, task) == {"pattern": "x"}
+    # Task names no subdirectory: untouched.
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": root}, "List all the files")["path"] == root
+
+
+def test_tool_agent_rewrites_list_dir_to_task_subdir(monkeypatch, tmp_path):
+    # The task-21 failure end to end: the model lists the repo root
+    # when the task asks for the agent_farm subdirectory. The path
+    # check must rewrite the call to the subdirectory before the
+    # tool runs, so the answer lists the right files.
+    import os
+
+    import agent_farm.agent as agent_module
+
+    (tmp_path / "agent_farm").mkdir()
+    (tmp_path / "agent_farm" / "colony.py").write_text("# colony\n")
+    (tmp_path / "agent_farm" / "agent.py").write_text("# agent\n")
+    (tmp_path / "README.md").write_text("# readme\n")
+    monkeypatch.chdir(tmp_path)
+
+    seen = {"path": None}
+
+    def fake_execute(tool_name, role, **kwargs):
+        seen["path"] = kwargs.get("path")
+        path = kwargs.get("path", "")
+        items = sorted(os.listdir(path)) if os.path.isdir(path) else []
+        return {"path": path, "items": items, "count": len(items)}
+
+    def fake_query(model, prompt, schema):
+        return {"tool": "list_dir", "arg": str(tmp_path)}
+
+    monkeypatch.setattr(agent_module, "query_ollama_structured", fake_query)
+    monkeypatch.setattr(agent_module, "execute_tool", fake_execute)
+    monkeypatch.setattr(
+        agent_module, "query_ollama_sync",
+        lambda model, prompt: "ANSWER: The agent_farm directory contains colony.py and agent.py",
+    )
+
+    result = agent_module.run_tool_agent(
+        "guardian", "fake-model", "List the Python files in the agent_farm directory"
+    )
+    # The tool must have run on the subdirectory, not the root.
+    assert seen["path"] is not None
+    assert seen["path"].replace("\\", "/").endswith("/agent_farm")
+    assert "colony.py" in result["answer"]
+    assert result["status"] == "completed"
+
+
 def test_quick_swarm_routes_search_through_tool_path(monkeypatch):
     # The 25-test proved the plain path cannot do system-state
     # tasks: it has no tools, so the model answers UNCERTAIN.

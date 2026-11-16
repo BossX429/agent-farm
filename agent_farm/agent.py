@@ -16,7 +16,8 @@ from .tools import (
     get_tools_for_role,
     get_tool_descriptions_for_role,
     execute_tool,
-    TOOL_REGISTRY
+    TOOL_REGISTRY,
+    _canonical_path,
 )
 from .colony_profiles import record_colony_run
 from .profiles import (
@@ -460,6 +461,78 @@ def _resolve_answer(answer: str, tool_history, iteration: int):
     return _fallback_answer(tool_history), None
 
 
+def _task_subdir(task: str) -> Optional[str]:
+    """Return the one subdirectory of the working dir named in the task.
+
+    The task-21 failure: the model lists the repo root
+    (C:/.../agent-farm) when the task asks for the agent_farm
+    subdirectory, because the names look alike and the prompt's
+    list_dir example IS the root path. The model has the correct
+    path in a few-shot example and still uses the root, so no
+    prompt text fixes it -- the path must be corrected in code.
+    This finds the subdirectory the task actually names, by
+    matching real subdirectory names against the task text
+    (whole-word, case-insensitive). Returns the name only when
+    exactly one subdirectory is named; None when none (or more
+    than one, which is ambiguous and left alone).
+    """
+    try:
+        entries = os.listdir(os.getcwd())
+    except OSError:
+        return None
+    task_lower = task.lower()
+    matches = []
+    for name in sorted(entries):
+        if not os.path.isdir(os.path.join(os.getcwd(), name)):
+            continue
+        # Whole-word match. Underscores are word characters, so a
+        # plain substring check would also match "xagent_farm";
+        # the lookarounds keep it to a standalone name.
+        if re.search(
+            r"(?<![A-Za-z0-9_])" + re.escape(name.lower()) + r"(?![A-Za-z0-9_])",
+            task_lower,
+        ):
+            matches.append(name)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _resolve_list_dir_path(tool_name: str, kwargs: Dict, task: str) -> Dict:
+    """Rewrite a list_dir call on the working dir to the subdirectory
+    the task names, if any. Returns the (possibly rewritten) kwargs.
+
+    Only list_dir, only when the task names exactly one subdirectory
+    of the working dir, and only when the model's path resolves to
+    the working dir itself (empty, ".", or the root path). Anything
+    else passes through untouched: a path to a different directory
+    may be right, or a different mistake, and this check does not
+    judge it. The rewrite is deterministic -- the model ignores the
+    correct path in the few-shot example, so the correction has to
+    happen in code, not in the prompt. The rewritten call is what
+    gets recorded in tool_history, so the record shows what ran.
+    """
+    if tool_name != "list_dir":
+        return kwargs
+    subdir = _task_subdir(task)
+    if subdir is None:
+        return kwargs
+    raw_path = kwargs.get("path", "") or ""
+    try:
+        canon = _canonical_path(raw_path) if raw_path else _canonical_path(os.getcwd())
+    except Exception:
+        return kwargs
+    workdir = _canonical_path(os.getcwd())
+    # normcase: on Windows the same directory can differ by case.
+    if os.path.normcase(canon) != os.path.normcase(workdir):
+        return kwargs
+    # The model listed the working dir but the task names a
+    # subdirectory. Rewrite to that subdirectory.
+    new_kwargs = dict(kwargs)
+    new_kwargs["path"] = os.path.join(workdir, subdir).replace("\\", "/")
+    return new_kwargs
+
+
 def format_result_simple(result: Dict) -> Optional[str]:
     """Format ONLY for simple system queries - NOT directory listings"""
     if "error" in result:
@@ -737,6 +810,13 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
                 # Got a valid tool call?
                 if tool_name:
                     kwargs = result if isinstance(result, dict) else {}
+                    # Path check: a list_dir on the working dir when
+                    # the task names a subdirectory is the #21
+                    # failure (repo root vs agent_farm subdir) --
+                    # rewrite it to the subdirectory in code, since
+                    # the model ignores the correct path in the
+                    # few-shot example.
+                    kwargs = _resolve_list_dir_path(tool_name, kwargs, task)
                     tool_result = execute_tool(tool_name, role, **kwargs)
                     
                     tool_history.append({
@@ -879,6 +959,8 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
         # Try to parse tool call
         tool_name, kwargs = parse_tool_call_regex(response)
         if tool_name:
+            # Same #21 path check as the structured path above.
+            kwargs = _resolve_list_dir_path(tool_name, kwargs, task)
             result = execute_tool(tool_name, role, **kwargs)
             
             tool_history.append({
