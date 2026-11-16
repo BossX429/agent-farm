@@ -337,12 +337,127 @@ def _summarize_result(result: Dict) -> str:
         out = result.get('stdout', '')[:200]
         return out if out else "(no output)"
     if "items" in result:
-        return f"{result.get('count', 0)} items"
+        items = result.get("items", [])
+        names = ", ".join(str(i) for i in items[:10])
+        suffix = ", ..." if len(items) > 10 else ""
+        return f"{result.get('count', len(items))} items: {names}{suffix}"
     if "content" in result:
-        return f"{len(result.get('content', ''))} chars"
+        content = result.get("content", "")
+        return f"{len(content)} chars: {content[:200]}"
     if "cpu_percent" in result:
         return f"CPU:{result['cpu_percent']}% MEM:{result.get('memory_percent')}%"
     return str(result)[:200]
+
+
+# Words too common to prove an answer used the tool data. A shared
+# "the" or "and" says nothing; a shared file name or model name does.
+_GROUNDING_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "from", "that", "this", "are", "was",
+    "were", "been", "has", "have", "had", "not", "but", "you", "your",
+    "its", "into", "over", "under", "when", "where", "which", "what",
+    "how", "all", "any", "can", "could", "should", "would", "there",
+    "here", "then", "than", "them", "they", "their", "does", "did",
+    "will", "just", "about", "also", "more", "most", "some", "such",
+})
+
+# Minimum length for a model-produced answer to be trusted as-is.
+# The '11' failure: the scout answered a search task with the literal
+# string '11' after a good search_code result. A real answer to a
+# search/check/list task is a sentence or a list, never 2 characters.
+MIN_ANSWER_CHARS = 10
+
+# Nudge used when a degenerate answer is rejected and iterations
+# remain: tell the model to answer again from the tool data.
+_DEGENERATE_NUDGE = (
+    "Your answer was too short or did not use the tool results. "
+    "Answer again using the actual data from the tool results - "
+    "include file names, numbers, or text from the results."
+)
+
+
+def _content_words(text: str) -> set:
+    """Content words in a string: dotted names (a.py, colony.py) and
+    alphabetic words of 3+ letters, lowercased, stopwords removed.
+    Pure numbers never count: a line number is not evidence the
+    answer used the data."""
+    words = set()
+    for token in re.findall(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+", text):
+        words.add(token.lower())
+    for word in re.findall(r"[A-Za-z]{3,}", text):
+        lw = word.lower()
+        if lw not in _GROUNDING_STOPWORDS:
+            words.add(lw)
+    return words
+
+
+def _tool_result_words(tool_history) -> set:
+    """Content words from every non-empty tool result, values only.
+    Keys like 'file'/'line'/'matches' are not collected: they would
+    match any answer that mentions them. Walks dicts/lists."""
+    words = set()
+    for entry in tool_history:
+        result = entry.get("result", {})
+        if _is_empty_result(result):
+            continue
+        stack = [result]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                stack.extend(item.values())
+            elif isinstance(item, (list, tuple)):
+                stack.extend(item)
+            elif isinstance(item, str):
+                words |= _content_words(item)
+    return words
+
+
+def _is_degenerate_answer(answer: str, tool_history) -> bool:
+    """True when a model-produced answer is too thin to trust.
+
+    Two ways an answer can be degenerate: it is too short to say
+    anything (the '11' failure), or it shares no content word with
+    the tool data it claims to answer from (a guess, not an answer).
+    A bare answer with no tool history yet is judged on length alone.
+    """
+    text = (answer or "").strip()
+    if len(text) < MIN_ANSWER_CHARS:
+        return True
+    if not tool_history:
+        return False
+    words = _tool_result_words(tool_history)
+    if not words:
+        return False
+    return not (_content_words(text) & words)
+
+
+def _fallback_answer(tool_history) -> str:
+    """A substantive answer built from the tool data itself, used
+    when the model keeps giving degenerate answers and iterations
+    are out. Better than a bare '11': the data is the answer."""
+    parts = [
+        _summarize_result(h["result"])
+        for h in tool_history
+        if not _is_empty_result(h["result"])
+    ]
+    if not parts:
+        return "No usable tool data was returned."
+    return "From the tool results: " + "; ".join(parts)
+
+
+def _resolve_answer(answer: str, tool_history, iteration: int):
+    """Accept a model-produced answer, or reject it as degenerate.
+
+    Returns (answer, None) when the answer is substantive enough to
+    trust, (None, nudge) when it is degenerate and iterations remain
+    (caller sets the nudge as context and continues), and
+    (fallback, None) when it is degenerate on the last iteration
+    (caller returns the fallback, built from the tool data itself).
+    """
+    if not _is_degenerate_answer(answer, tool_history):
+        return answer, None
+    if iteration < MAX_TOOL_ITERATIONS:
+        return None, _DEGENERATE_NUDGE
+    return _fallback_answer(tool_history), None
 
 
 def format_result_simple(result: Dict) -> Optional[str]:
@@ -601,8 +716,18 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
                             + ", ".join(untried) + "."
                         )
                         continue
+                    # Substance guard: a bare answer that is too
+                    # short or ignores the tool data is not an
+                    # answer (the '11' failure). Retry while
+                    # iterations remain, else fall back to the data.
+                    answer, nudge = _resolve_answer(
+                        clean_answer(result), tool_history, iteration
+                    )
+                    if nudge is not None:
+                        context = nudge
+                        continue
                     return {
-                        "answer": clean_answer(result),
+                        "answer": answer,
                         "tool_calls": tool_history,
                         "iterations": iteration,
                         "status": "completed",
@@ -687,8 +812,16 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
                         cont_response = query_ollama_structured(model, cont_prompt, cont_schema)
                         
                         if cont_response.get("action") == "answer":
+                            answer, nudge = _resolve_answer(
+                                clean_answer(cont_response.get("answer", "")),
+                                tool_history,
+                                iteration,
+                            )
+                            if nudge is not None:
+                                context = nudge
+                                continue
                             return {
-                                "answer": clean_answer(cont_response.get("answer", "")),
+                                "answer": answer,
                                 "tool_calls": tool_history,
                                 "iterations": iteration,
                                 "status": "completed",
@@ -704,11 +837,21 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
                         answer = final_response.strip()
                         if answer.upper().startswith("ANSWER:"):
                             answer = answer[7:].strip()
+                        # Substance guard: the forced-answer path is
+                        # where the '11' failure came from - the
+                        # model answered from good tool data with a
+                        # 2-character string and nothing checked it.
+                        answer, nudge = _resolve_answer(
+                            clean_answer(answer), tool_history, iteration
+                        )
+                        if nudge is not None:
+                            context = nudge
+                            continue
                         return {
-                            "answer": clean_answer(answer),
+                            "answer": answer,
                             "tool_calls": tool_history,
                             "iterations": iteration + 1,
-                            "status": "completed", 
+                            "status": "completed",
                             "mode": "structured+forced"
                         }
                     
@@ -721,6 +864,10 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
         # Check for answer
         answer = extract_answer(response)
         if answer and tool_history:
+            answer, nudge = _resolve_answer(answer, tool_history, iteration)
+            if nudge is not None:
+                context = nudge
+                continue
             return {
                 "answer": answer,
                 "tool_calls": tool_history,
@@ -760,8 +907,14 @@ def run_tool_agent(role: str, model: str, task: str, context: str = "", deep: bo
             answer = final_response.strip()
             if answer.upper().startswith("ANSWER:"):
                 answer = answer[7:].strip()
+            answer, nudge = _resolve_answer(
+                clean_answer(answer), tool_history, iteration
+            )
+            if nudge is not None:
+                context = nudge
+                continue
             return {
-                "answer": clean_answer(answer),
+                "answer": answer,
                 "tool_calls": tool_history,
                 "iterations": iteration + 1,
                 "status": "completed",
