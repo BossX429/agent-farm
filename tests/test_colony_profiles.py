@@ -660,7 +660,11 @@ def test_tool_agent_refuses_answer_without_tool_data(monkeypatch):
 
     def fake_execute(tool_name, role, **kwargs):
         if kwargs.get("pattern") == "COLONY_TYPES":
-            return {"total_matches": 1, "matches": [{"file": "colony_profiles.py", "line": 1, "text": "COLONY_TYPES = {...}"}], "files_searched": 1}
+            # Realistic match text: the real COLONY_TYPES definition
+            # lists the type names, so a forced answer naming them
+            # shares words with the tool data (the substance check
+            # below keys off that overlap).
+            return {"total_matches": 1, "matches": [{"file": "colony_profiles.py", "line": 1, "text": "COLONY_TYPES = {'standard': ..., 'fast': ..., 'heavy': ..., 'hybrid': ...}"}], "files_searched": 1}
         return {"total_matches": 0, "matches": [], "files_searched": 1}
 
     monkeypatch.setattr(agent_module, "query_ollama_structured", fake_query)
@@ -717,6 +721,228 @@ def test_is_empty_result_labels_empty_and_nonempty():
     assert not _is_empty_result({"stdout": "hello"})
     assert "does NOT prove nothing exists" in _summarize_result({"total_matches": 0, "matches": []})
     assert "does NOT prove" in _summarize_result({"items": [], "count": 0})
+    # The fallback must carry the data, not just a count: a list
+    # summary names the items, a read summary shows the content.
+    assert "a.py" in _summarize_result({"items": ["a.py", "b.py"], "count": 2})
+    assert "hello world" in _summarize_result({"content": "hello world"})
+
+
+def test_is_degenerate_answer_catches_short_and_ungrounded():
+    # The task-12 failure: the scout got a good search_code result,
+    # then the forced-answer call returned the literal string '11'.
+    # A 2-character answer after a good tool result is degenerate,
+    # however the model got there.
+    from agent_farm.agent import (
+        _content_words,
+        _is_degenerate_answer,
+        _tool_result_words,
+    )
+
+    search_history = [{
+        "tool": "search_code",
+        "args": {"pattern": "synthesizer"},
+        "result": {
+            "total_matches": 1,
+            "matches": [{
+                "file": "agent_farm/ollama.py",
+                "line": 123,
+                "text": "synthesizer = qwen3:30b-a3b-q3k",
+            }],
+            "files_searched": 1,
+        },
+    }]
+
+    assert _is_degenerate_answer("11", search_history)
+    assert _is_degenerate_answer("", search_history)
+    assert _is_degenerate_answer("Yes", search_history)
+    # A good answer shares words with the tool data.
+    assert not _is_degenerate_answer(
+        "The synthesizer model is qwen3:30b-a3b-q3k in agent_farm/ollama.py",
+        search_history,
+    )
+    # A long answer that ignores the tool data is still degenerate:
+    # it is a guess, not an answer from the results.
+    assert _is_degenerate_answer(
+        "The answer is definitely in the main module somewhere",
+        search_history,
+    )
+    # Short file names still ground through their dotted form.
+    list_history = [{
+        "tool": "list_dir",
+        "args": {"path": "/tmp"},
+        "result": {"items": ["a.py", "b.py"], "count": 2},
+    }]
+    assert not _is_degenerate_answer("a.py, b.py", list_history)
+    # No tool history yet: judged on length alone.
+    assert _is_degenerate_answer("11", [])
+    assert not _is_degenerate_answer("a long enough bare answer", [])
+    # Tool-result words come from values only: 'file' and 'line'
+    # are keys, not evidence, so an answer sharing only them is
+    # still degenerate.
+    words = _tool_result_words(search_history)
+    assert "ollama.py" in words
+    assert "synthesizer" in words
+    assert "qwen" in words
+    assert "file" not in words
+    assert "line" not in words
+    # Pure numbers never count as grounding.
+    assert "123" not in words
+    assert _content_words("a.py") == {"a.py"}
+    assert "qwen" in _content_words("qwen3:30b-a3b-q3k")
+
+
+def test_tool_agent_rejects_degenerate_forced_answer(monkeypatch):
+    # The task-12 failure end to end: the scout got a good
+    # search_code result, then the forced-answer call returned '11'.
+    # The loop must reject it and ask again instead of returning it.
+    import agent_farm.agent as agent_module
+
+    calls = {"n": 0}
+
+    def fake_query(model, prompt, schema):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"tool": "search_code", "arg": "synthesizer"}
+        return {"action": "answer", "answer": "The synthesizer model is qwen3:30b-a3b-q3k in agent_farm/ollama.py"}
+
+    def fake_execute(tool_name, role, **kwargs):
+        return {
+            "total_matches": 1,
+            "matches": [{
+                "file": "agent_farm/ollama.py",
+                "line": 123,
+                "text": "synthesizer = qwen3:30b-a3b-q3k",
+            }],
+            "files_searched": 1,
+        }
+
+    monkeypatch.setattr(agent_module, "query_ollama_structured", fake_query)
+    monkeypatch.setattr(agent_module, "execute_tool", fake_execute)
+    monkeypatch.setattr(agent_module, "query_ollama_sync", lambda model, prompt: "ANSWER: 11")
+
+    result = agent_module.run_tool_agent("scout", "fake-model", "Where is the synthesizer model named?")
+    assert result["answer"] != "11"
+    assert "qwen3:30b" in result["answer"]
+    assert len(result["tool_calls"]) == 1
+    assert calls["n"] == 2
+
+
+def test_tool_agent_falls_back_to_tool_data_on_last_iteration(monkeypatch):
+    # If the model keeps giving degenerate answers, the loop must
+    # not return one: on the last iteration the tool data itself is
+    # the answer.
+    import agent_farm.agent as agent_module
+
+    calls = {"n": 0}
+
+    def fake_query(model, prompt, schema):
+        calls["n"] += 1
+        return {"tool": "list_dir", "arg": f"/tmp/{calls['n']}"}
+
+    monkeypatch.setattr(agent_module, "query_ollama_structured", fake_query)
+    monkeypatch.setattr(
+        agent_module, "execute_tool",
+        lambda t, r, **k: {"items": ["a.py", "b.py"], "count": 2},
+    )
+    monkeypatch.setattr(agent_module, "query_ollama_sync", lambda model, prompt: "ANSWER: 11")
+
+    result = agent_module.run_tool_agent("scout", "fake-model", "List the files")
+    assert result["answer"] != "11"
+    assert "a.py" in result["answer"]
+    assert result["status"] == "completed"
+
+
+def test_task_subdir_finds_named_subdirectory(monkeypatch, tmp_path):
+    # _task_subdir matches real subdirectory names against the
+    # task text: whole-word, case-insensitive, exactly one match.
+    import os
+
+    import agent_farm.agent as agent_module
+
+    (tmp_path / "agent_farm").mkdir()
+    (tmp_path / "tests").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert agent_module._task_subdir("List the Python files in the agent_farm directory") == "agent_farm"
+    assert agent_module._task_subdir("List the files in the tests directory") == "tests"
+    assert agent_module._task_subdir("List the files in the AGENT_FARM directory") == "agent_farm"
+    assert agent_module._task_subdir("List all the files") is None
+    assert agent_module._task_subdir("List the files in the nowhere directory") is None
+    # Two named subdirectories is ambiguous: leave it alone.
+    assert agent_module._task_subdir("List the files in agent_farm and tests") is None
+    # A name inside a longer word does not match.
+    assert agent_module._task_subdir("List the files in the testing directory") is None
+
+
+def test_resolve_list_dir_path_rewrites_root_to_subdir(monkeypatch, tmp_path):
+    # A list_dir on the working dir, when the task names a
+    # subdirectory, is rewritten to that subdirectory. Anything
+    # else passes through untouched.
+    import os
+
+    import agent_farm.agent as agent_module
+
+    (tmp_path / "agent_farm").mkdir()
+    (tmp_path / "agent_farm" / "colony.py").write_text("# colony\n")
+    monkeypatch.chdir(tmp_path)
+    task = "List the Python files in the agent_farm directory"
+    root = str(tmp_path)
+    # Root, empty, and "." all mean the working dir: rewritten.
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": root}, task)["path"].replace("\\", "/").endswith("/agent_farm")
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": ""}, task)["path"].replace("\\", "/").endswith("/agent_farm")
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": "."}, task)["path"].replace("\\", "/").endswith("/agent_farm")
+    # Already the subdirectory: untouched.
+    sub = os.path.join(root, "agent_farm")
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": sub}, task)["path"] == sub
+    # A different directory: untouched.
+    other = os.path.join(root, "tests")
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": other}, task)["path"] == other
+    # Not list_dir: untouched.
+    assert agent_module._resolve_list_dir_path("search_code", {"pattern": "x"}, task) == {"pattern": "x"}
+    # Task names no subdirectory: untouched.
+    assert agent_module._resolve_list_dir_path("list_dir", {"path": root}, "List all the files")["path"] == root
+
+
+def test_tool_agent_rewrites_list_dir_to_task_subdir(monkeypatch, tmp_path):
+    # The task-21 failure end to end: the model lists the repo root
+    # when the task asks for the agent_farm subdirectory. The path
+    # check must rewrite the call to the subdirectory before the
+    # tool runs, so the answer lists the right files.
+    import os
+
+    import agent_farm.agent as agent_module
+
+    (tmp_path / "agent_farm").mkdir()
+    (tmp_path / "agent_farm" / "colony.py").write_text("# colony\n")
+    (tmp_path / "agent_farm" / "agent.py").write_text("# agent\n")
+    (tmp_path / "README.md").write_text("# readme\n")
+    monkeypatch.chdir(tmp_path)
+
+    seen = {"path": None}
+
+    def fake_execute(tool_name, role, **kwargs):
+        seen["path"] = kwargs.get("path")
+        path = kwargs.get("path", "")
+        items = sorted(os.listdir(path)) if os.path.isdir(path) else []
+        return {"path": path, "items": items, "count": len(items)}
+
+    def fake_query(model, prompt, schema):
+        return {"tool": "list_dir", "arg": str(tmp_path)}
+
+    monkeypatch.setattr(agent_module, "query_ollama_structured", fake_query)
+    monkeypatch.setattr(agent_module, "execute_tool", fake_execute)
+    monkeypatch.setattr(
+        agent_module, "query_ollama_sync",
+        lambda model, prompt: "ANSWER: The agent_farm directory contains colony.py and agent.py",
+    )
+
+    result = agent_module.run_tool_agent(
+        "guardian", "fake-model", "List the Python files in the agent_farm directory"
+    )
+    # The tool must have run on the subdirectory, not the root.
+    assert seen["path"] is not None
+    assert seen["path"].replace("\\", "/").endswith("/agent_farm")
+    assert "colony.py" in result["answer"]
+    assert result["status"] == "completed"
 
 
 def test_quick_swarm_routes_search_through_tool_path(monkeypatch):
