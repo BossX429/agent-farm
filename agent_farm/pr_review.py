@@ -436,6 +436,37 @@ def review_diff(
     }
 
 
+def _validate_git_ref(repo_path: str, ref: str) -> Optional[str]:
+    """Return an error string when `ref` is not safe to pass to git, else None.
+
+    Audit H2: base and head come from the caller (the review_pr MCP
+    tool takes them from the model), and review_branch put them
+    straight into `git diff f"{base}...{head}"` with no check. An
+    argv element starting with '-' is parsed as an option, not a
+    revision, so `--output=<path>` on git diff would write a file.
+    Reject leading dashes and any whitespace outright, then prove
+    the ref names a real object with `git rev-parse --verify`
+    before it is used. A ref that does not exist fails closed with
+    a clear error instead of a cryptic diff failure.
+    """
+    if not ref or ref.startswith("-"):
+        return f"ref {ref!r} is not a valid git ref."
+    if any(ch.isspace() for ch in ref):
+        return f"ref {ref!r} is not a valid git ref."
+    try:
+        proc = subprocess.run(
+            [GIT_EXE, "-C", repo_path, "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not verify git ref {ref!r}: {exc}"
+    if proc.returncode != 0:
+        return f"unknown git ref {ref!r}."
+    return None
+
+
 def review_branch(
     repo_path: str,
     base: str,
@@ -451,6 +482,12 @@ def review_branch(
     """
     if not repo_path or not base:
         return {"files": [], "findings": [], "error": "repo_path and base are required."}
+    if not head:
+        head = "HEAD"
+    for ref in (base, head):
+        error = _validate_git_ref(repo_path, ref)
+        if error:
+            return {"files": [], "findings": [], "error": error}
     try:
         proc = subprocess.run(
             [GIT_EXE, "-C", repo_path, "diff", f"{base}...{head}"],
