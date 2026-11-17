@@ -238,12 +238,63 @@ def is_swarm_read_allowed(path: str) -> bool:
     )
 
 
+# Word characters for blocklist boundary checks: a pattern must not
+# match as letters inside a longer word.
+_WORD_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+)
+
+
+def _blocked_pattern_matches(cmd_lower: str, pattern: str) -> bool:
+    """True iff `pattern` occurs in `cmd_lower` as a real token.
+
+    The old check was a plain substring match, so "git add ." was
+    blocked because "dd " sits inside "add ", and "rm -f /tmp/x"
+    was blocked because "rm -f /" sits inside it. A pattern only
+    counts at a token boundary: it must start at the beginning of
+    the string or after a non-word character (unless the pattern
+    itself starts with a symbol, which cannot sit inside a word),
+    and it must end at the end of the string or before a non-word
+    character (unless the pattern ends with a symbol). A pattern
+    ending in '/' is stricter: the slash must be a whole token,
+    followed by a space or the end, so "rm -f /tmp/x" and
+    "mv /tmp/a /tmp/b" pass while "rm -f /" and "mv / /tmp" are
+    still blocked. Known edge, accepted deliberately: a pattern
+    ending in digits matches by the same word rule, so "chmod 7777"
+    is not caught the way "chmod 777" is -- the blocklist is
+    defence-in-depth only (there is no shell), not the boundary.
+    """
+    core = pattern.strip()
+    if not core:
+        return False
+    start = 0
+    while True:
+        i = cmd_lower.find(core, start)
+        if i < 0:
+            return False
+        before_ok = (
+            i == 0
+            or core[0] not in _WORD_CHARS
+            or cmd_lower[i - 1] not in _WORD_CHARS
+        )
+        j = i + len(core)
+        if core.endswith("/"):
+            after_ok = j >= len(cmd_lower) or cmd_lower[j] == " "
+        elif core[-1] not in _WORD_CHARS:
+            after_ok = True
+        else:
+            after_ok = j >= len(cmd_lower) or cmd_lower[j] not in _WORD_CHARS
+        if before_ok and after_ok:
+            return True
+        start = i + 1
+
+
 def is_command_safe(cmd: str) -> bool:
     """Check if command is safe to execute (blocklist only -- see note above)."""
     # Collapse runs of whitespace so "rm  -rf" cannot evade "rm -rf".
     cmd_lower = re.sub(r"\s+", " ", cmd.lower())
     for blocked in BLOCKED_COMMANDS:
-        if blocked in cmd_lower:
+        if _blocked_pattern_matches(cmd_lower, blocked):
             return False
     return True
 
