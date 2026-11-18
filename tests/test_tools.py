@@ -32,6 +32,144 @@ def test_blocked_paths():
     assert not tools.is_path_safe("/proc/kcore")
 
 
+# ---------- H1: unified read boundary (audit 2026-11-17) ----------
+# The normal read tools used to check only BLOCKED_PATHS (8 Linux
+# files), while the swarm tools also blocked whole system dirs.
+# The boundary is now one deny list (READ_DENY_ROOTS) enforced by
+# is_path_safe, so a normal tool can no longer read what a swarm
+# tool refuses -- including home secrets and Windows paths.
+
+def test_read_boundary_blocks_home_secrets():
+    home = os.path.expanduser("~")
+    for secret in (".ssh", ".ssh/id_ed25519", ".aws/credentials",
+                   ".gnupg", ".config", ".mozilla", ".netrc"):
+        assert not tools.is_path_safe(os.path.join(home, secret)), secret
+    # The tools refuse the path instead of probing it: file_exists
+    # reports a block, not an existence answer.
+    assert "error" in tools.tool_read_file(os.path.join(home, ".ssh/id_ed25519"))
+    assert "error" in tools.tool_list_dir(os.path.join(home, ".ssh"))
+    result = tools.tool_file_exists(os.path.join(home, ".aws/credentials"))
+    assert "error" in result and "exists" not in result
+
+
+def test_read_boundary_blocks_system_dirs():
+    # The swarm guard already blocked these; the normal tools did
+    # not (the H1 gap). /etc/hostname is the audit's example: a
+    # benign file in a denied directory is still denied.
+    assert not tools.is_path_safe("/etc/hostname")
+    assert not tools.is_path_safe("/usr/bin/python3")
+    assert not tools.is_path_safe("/proc/self/status")
+    assert not tools.is_path_safe("/sys/kernel")
+    assert "error" in tools.tool_read_file("/etc/hostname")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only paths")
+def test_read_boundary_blocks_windows_roots():
+    profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    assert not tools.is_path_safe(r"C:\Windows\System32\config\SAM")
+    assert not tools.is_path_safe(
+        os.path.join(profile, "AppData", "Local", "Google", "Chrome", "User Data")
+    )
+    assert not tools.is_path_safe(r"C:\ProgramData\some-app\config.json")
+    # Case and separator mangling must not slip past a deny root
+    # that does not exist on disk yet (realpath alone only folds
+    # the case of components that exist).
+    assert not tools.is_path_safe("c:/windows/system32/config/sam")
+    assert not tools.is_path_safe(r"C:\WINDOWS\System32")
+
+
+def test_read_boundary_allows_project_and_tmp(tmp_path):
+    good = tmp_path / "notes.txt"
+    good.write_text("hello")
+    assert tools.is_path_safe(str(good))
+    assert tools.tool_read_file(str(good))["content"] == "hello"
+    assert tools.tool_list_dir(str(tmp_path))["count"] == 1
+    assert tools.tool_file_exists(str(good))["exists"] is True
+    # The swarm check is the same boundary now, not a looser one.
+    assert tools.is_swarm_read_allowed(str(good))
+    assert not tools.is_swarm_read_allowed("/etc/hostname")
+
+
+def test_read_boundary_temp_dir_carve_out(monkeypatch, tmp_path):
+    # The temp dir stays readable even when a deny root covers its
+    # parent: on Windows the real temp dir sits under AppData, a
+    # deny root, and without this carve-out every tmp_path test
+    # fails there. The deny root added here is the temp dir's
+    # parent -- an ancestor of Temp, like AppData is -- so the test
+    # pins the carve-out on Linux too, where /tmp is not denied.
+    # A path under that parent but outside Temp is still denied,
+    # so the exception is narrow, not a blanket allow.
+    temp_parent = os.path.dirname(os.path.realpath(tempfile.gettempdir()))
+    monkeypatch.setattr(
+        tools, "READ_DENY_ROOTS",
+        list(tools.READ_DENY_ROOTS) + [temp_parent],
+    )
+    good = tmp_path / "scratch.txt"
+    good.write_text("scratch")
+    assert tools.is_path_safe(str(good))
+    assert tools.tool_read_file(str(good))["content"] == "scratch"
+    assert not tools.is_path_safe(os.path.join(temp_parent, "not-temp-marker"))
+
+
+def test_read_boundary_temp_symlink_escape_blocked(monkeypatch, tmp_path):
+    # A symlink inside the temp dir pointing at a denied location
+    # does not inherit the carve-out: the canonical path is denied.
+    denied = tmp_path / "denied"
+    denied.mkdir()
+    (denied / "secret.txt").write_text("secret")
+    link = tmp_path / "escape.txt"
+    try:
+        link.symlink_to(denied / "secret.txt")
+    except OSError:
+        pytest.skip("cannot create symlink here")
+    monkeypatch.setattr(
+        tools, "READ_DENY_ROOTS", list(tools.READ_DENY_ROOTS) + [str(denied)]
+    )
+    assert not tools.is_path_safe(str(link))
+    assert "error" in tools.tool_read_file(str(link))
+
+
+def test_search_code_skips_denied_subdir(monkeypatch, tmp_path):
+    # A denied directory inside the search root must be pruned from
+    # the walk, not searched. The deny list is monkeypatched so the
+    # test does not depend on the real home or system dirs.
+    root = tmp_path / "root"
+    denied = root / "denied"
+    denied.mkdir(parents=True)
+    (root / "good.py").write_text("MARKER_ONE = 1\n")
+    (denied / "secret.py").write_text("MARKER_ONE = 2\n")
+    monkeypatch.setattr(
+        tools, "READ_DENY_ROOTS", list(tools.READ_DENY_ROOTS) + [str(denied)]
+    )
+    result = tools.tool_search_code("MARKER_ONE", str(root))
+    found = {m["file"] for m in result["matches"]}
+    assert str(root / "good.py") in found
+    assert str(denied / "secret.py") not in found
+
+
+def test_search_code_skips_symlinked_secret_file(monkeypatch, tmp_path):
+    # A symlinked file inside an allowed tree pointing at a denied
+    # location must not be read: the canonical path is denied.
+    root = tmp_path / "root"
+    denied = tmp_path / "denied"
+    denied.mkdir(parents=True)
+    root.mkdir()
+    (denied / "secret.py").write_text("MARKER_TWO = 1\n")
+    (root / "good.py").write_text("MARKER_TWO = 2\n")
+    link = root / "link.py"
+    try:
+        link.symlink_to(denied / "secret.py")
+    except OSError:
+        pytest.skip("cannot create symlink here")
+    monkeypatch.setattr(
+        tools, "READ_DENY_ROOTS", list(tools.READ_DENY_ROOTS) + [str(denied)]
+    )
+    result = tools.tool_search_code("MARKER_TWO", str(root))
+    found = {m["file"] for m in result["matches"]}
+    assert str(root / "good.py") in found
+    assert str(link) not in found
+
+
 def test_write_allowlist_prefix_lookalike(tmp_path):
     # "/tmpfoo" must not pass as "/tmp", and a path outside the
     # allowlist must not be writable even if it shares a prefix.

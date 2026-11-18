@@ -195,14 +195,34 @@ def _is_within(path: str, directory: str) -> bool:
         return False
 
 
+def _dedicated_temp_root():
+    """The canonical platform temp dir, or None if it is not trusted.
+
+    The system temp dir is the sanctioned scratch area: writes are
+    allowlisted there, and pytest's tmp_path lives there. Only a
+    real, dedicated temp location counts (see _is_dedicated_temp_dir):
+    a TEMP/TMPDIR pointing at a home dir or a drive root is not
+    trusted.
+    """
+    tempdir = tempfile.gettempdir()
+    if not _is_dedicated_temp_dir(tempdir):
+        return None
+    return os.path.realpath(tempdir)
+
+
 def is_path_safe(path: str) -> bool:
-    """Check if a canonical path is safe to access."""
-    canonical = _canonical_path(path)
-    for blocked in BLOCKED_PATHS:
-        blocked_canonical = os.path.realpath(blocked)
-        if canonical == blocked_canonical or _is_within(canonical, blocked_canonical):
-            return False
-    return True
+    """Check if a canonical path is safe to access.
+
+    The read boundary is one deny list (READ_DENY_ROOTS): the old
+    specific blocked files, the swarm system dirs, the home secret
+    locations, and the Windows system/credential roots. Symlinks and
+    ".." are resolved first, and case is folded, so a mangled or
+    differently-cased spelling of a denied path does not pass. The
+    one exception is the platform temp dir (see _is_denied): it is
+    the sanctioned scratch area, and on Windows it lives under
+    AppData, so it stays readable even though its parent is denied.
+    """
+    return not _is_denied(_canonical_path(path))
 
 
 def is_write_path_allowed(path: str) -> bool:
@@ -222,20 +242,112 @@ def is_write_path_allowed(path: str) -> bool:
 FILE_SWARM_BLOCKED_DIRS = ["/etc", "/usr", "/bin", "/sbin", "/boot", "/root", "/sys", "/proc"]
 
 
+# Home-directory secret locations: the model's read tools must never
+# reach them, on either OS. Computed from the current user's home
+# directory at import time, so the same code is right on the VM
+# (/home/hatch) and on the PC (C:\Users\kyleh). Each one holds
+# credentials or config a model has no business reading: SSH keys,
+# cloud credentials, GPG keys, app config (including browser
+# profiles), Firefox profiles, and .netrc credentials.
+_HOME_SECRET_DIRS = [
+    ".ssh", ".aws", ".gnupg", ".config", ".mozilla", ".netrc",
+]
+
+
+def _home_secret_roots() -> list:
+    home = os.path.expanduser("~")
+    return [os.path.join(home, name) for name in _HOME_SECRET_DIRS]
+
+
+def _windows_deny_roots() -> list:
+    """Windows system and credential locations, built from env vars.
+
+    Only built on Windows; the home-derived entries above already
+    cover the user profile's .ssh etc. AppData is the
+    credential/config home on Windows (browser profiles included),
+    and the system dirs hold the SAM/SYSTEM hives and
+    installed-program data. The drive root itself is deliberately
+    NOT denied: it would deny everything on the drive, since every
+    path is within it.
+    """
+    if os.name != "nt":
+        return []
+    roots = []
+    system_root = (
+        os.environ.get("SystemRoot")
+        or os.environ.get("windir")
+        or r"C:\Windows"
+    )
+    roots.append(system_root)
+    for env in ("ProgramData", "ProgramFiles", "ProgramFiles(x86)"):
+        value = os.environ.get(env)
+        if value:
+            roots.append(value)
+    user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    if user_profile:
+        roots.append(os.path.join(user_profile, "AppData"))
+    return roots
+
+
+# The single read boundary every read tool enforces (audit H1,
+# 2026-11-17): the old BLOCKED_PATHS files, the swarm blocked dirs,
+# the home secret locations, and (on Windows) the system/credential
+# roots. One list, one check, so a normal tool can no longer read
+# what a swarm tool refuses. Entries are canonicalised once here;
+# the check folds case again at call time (see _is_denied).
+READ_DENY_ROOTS = [
+    os.path.realpath(p)
+    for p in (
+        BLOCKED_PATHS
+        + FILE_SWARM_BLOCKED_DIRS
+        + _home_secret_roots()
+        + _windows_deny_roots()
+    )
+]
+
+
+def _is_denied(canonical: str) -> bool:
+    """True iff canonical `path` is a deny root or inside one.
+
+    Case is folded (normcase) before comparing, so a Windows path
+    spelled with different capitalisation cannot slip past a deny
+    root that does not exist on disk yet: realpath alone only
+    normalises the case of components that exist. On POSIX normcase
+    is the identity, so nothing changes there.
+
+    Temp-dir exception: a deny root that CONTAINS the platform temp
+    dir does not deny paths INSIDE the temp dir -- on Windows the
+    temp dir sits under AppData, a deny root, and the temp dir is
+    the sanctioned scratch area. The exception is narrow: a deny
+    root inside the temp dir still denies (so a denied subdirectory
+    of a search root is still skipped), and a path under the
+    containing root but outside the temp dir is still denied.
+    """
+    folded = os.path.normcase(canonical)
+    temp = _dedicated_temp_root()
+    temp_folded = os.path.normcase(temp) if temp is not None else None
+    for root in READ_DENY_ROOTS:
+        folded_root = os.path.normcase(root)
+        if folded == folded_root or _is_within(folded, folded_root):
+            if (
+                temp_folded is not None
+                and _is_within(temp_folded, folded_root)
+                and _is_within(folded, temp_folded)
+            ):
+                continue
+            return True
+    return False
+
+
 def is_swarm_read_allowed(path: str) -> bool:
     """True iff a swarm tool may read this canonical path.
 
-    Requires is_path_safe() AND not inside any FILE_SWARM_BLOCKED_DIRS
-    entry. Canonical (symlink-resolved) paths are used, so a symlink in
-    an allowed spot pointing at a blocked spot does not pass.
+    The read boundary is now unified (audit H1): the swarm tools
+    enforce the same deny list as the normal read tools, so this is
+    is_path_safe() under its old name, kept for its callers in
+    swarm_tools.py.
     """
-    if not is_path_safe(path):
-        return False
-    canonical = _canonical_path(path)
-    return not any(
-        canonical == os.path.realpath(d) or _is_within(canonical, os.path.realpath(d))
-        for d in FILE_SWARM_BLOCKED_DIRS
-    )
+    return is_path_safe(path)
 
 
 # Word characters for blocklist boundary checks: a pattern must not
@@ -860,7 +972,15 @@ def tool_search_code(pattern: str, path: str = ".", file_pattern: str = "*.py") 
     files_searched = 0
     truncated = False
     for root, dirs, files in os.walk(search_root):
-        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        # Prune denied subdirectories (e.g. AppData under a user
+        # profile, .ssh under a home dir): the root check above only
+        # covers the root itself, and os.walk would otherwise descend
+        # into a real denied subdirectory and read files there.
+        dirs[:] = [
+            d for d in dirs
+            if d not in skip_dirs
+            and is_path_safe(os.path.join(root, d))
+        ]
         for name in sorted(files):
             if not fnmatch.fnmatch(name, file_pattern):
                 continue
@@ -868,6 +988,11 @@ def tool_search_code(pattern: str, path: str = ".", file_pattern: str = "*.py") 
                 truncated = True
                 break
             file_path = os.path.join(root, name)
+            # A symlinked file inside an allowed tree can point at a
+            # denied location; the canonical check catches it, since
+            # is_path_safe resolves symlinks before comparing.
+            if not is_path_safe(file_path):
+                continue
             try:
                 with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()
