@@ -89,6 +89,32 @@ def test_command_blocklist_variants():
     assert tools.is_command_safe("echo hello")
 
 
+def test_command_blocklist_allows_ordinary_commands():
+    # Audit M1: the old substring match blocked ordinary commands
+    # because a blocked fragment sat inside another word or path.
+    # "dd " is inside "add ", "rm -f /" is inside "rm -f /tmp/x",
+    # and "mv /" is inside "mv /tmp/a /tmp/b". All four must pass.
+    assert tools.is_command_safe("git add .")
+    assert tools.is_command_safe('git commit -m "add feature"')
+    assert tools.is_command_safe("git status")
+    assert tools.is_command_safe("mv /tmp/a.txt /tmp/b.txt")
+    assert tools.is_command_safe("rm -f /tmp/leftover.txt")
+    assert tools.is_command_safe("echo add some text")
+
+
+def test_command_blocklist_still_blocks_dangerous_commands():
+    # The boundary fix must not let the dangerous forms through:
+    # destructive removal, moving the root, dd, unlink, chmod 777,
+    # and find -exec all stay blocked.
+    assert not tools.is_command_safe("rm -rf /")
+    assert not tools.is_command_safe("rm -f /")
+    assert not tools.is_command_safe("mv / /tmp")
+    assert not tools.is_command_safe("dd if=/dev/zero of=/dev/null")
+    assert not tools.is_command_safe("unlink /tmp/x")
+    assert not tools.is_command_safe("chmod 777 x")
+    assert not tools.is_command_safe("find . -exec ls {} +")
+
+
 def test_exec_simple_runs_without_shell():
     result = tools.tool_exec_cmd(f"{PY} -c \"print('hello')\"")
     assert result["returncode"] == 0

@@ -311,6 +311,60 @@ def test_review_branch_bad_repo_returns_error():
     assert "error" in result
 
 
+def test_review_branch_rejects_dash_leading_ref(tmp_path):
+    # Audit H2: a ref starting with '-' would be parsed by git as an
+    # option, not a revision, so --output=<path> on git diff would
+    # write a file. The ref must be rejected before git runs, and
+    # the file git would have written must not exist afterwards.
+    # Note the file git would write is "<target>...HEAD": the whole
+    # "--output=<target>...HEAD" argument is one option value.
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if shutil.which("git") is None:
+        pytest.skip("git not on PATH")
+    probe = subprocess.run(["git", "--version"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        pytest.skip("git does not run from a subprocess here")
+
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "t@t.t"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "t"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "a.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
+    )
+
+    target = tmp_path / "pwned.txt"
+    result = review_branch(str(tmp_path), f"--output={target}", query_fn=_fake_finding)
+    assert result["findings"] == []
+    assert "error" in result
+    assert not target.exists()
+    assert not (tmp_path / "pwned.txt...HEAD").exists()
+    # A ref with a space is rejected the same way, and so is a
+    # dash-leading head.
+    result = review_branch(str(tmp_path), "main --output=x", query_fn=_fake_finding)
+    assert "error" in result
+    result = review_branch(str(tmp_path), "HEAD", "-x", query_fn=_fake_finding)
+    assert "error" in result
+    # An unknown ref fails closed instead of reaching git diff.
+    result = review_branch(str(tmp_path), "no-such-branch-xyz", query_fn=_fake_finding)
+    assert "error" in result
+
+
 def test_review_branch_uses_git_diff(tmp_path):
     # A real local repo: one commit, then an uncommitted change.
     # review_branch must diff base...head and review the change.

@@ -412,23 +412,69 @@ def _tool_result_words(tool_history) -> set:
     return words
 
 
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _number_tokens(text: str) -> set:
+    """Number tokens in a string: integers and decimals, as written,
+    including a leading minus. Used so a numeric tool result can
+    ground an answer: the answer must contain one of the numbers
+    the tool actually returned."""
+    return set(_NUMBER_RE.findall(text or ""))
+
+
+def _tool_result_numbers(tool_history) -> set:
+    """Number tokens from every non-empty tool result, values only.
+    Walks dicts/lists like _tool_result_words. Numeric values count
+    as their own string form; booleans are not numbers here (True
+    would stringify to 'True', not a digit)."""
+    numbers = set()
+    for entry in tool_history:
+        result = entry.get("result", {})
+        if _is_empty_result(result):
+            continue
+        stack = [result]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                stack.extend(item.values())
+            elif isinstance(item, (list, tuple)):
+                stack.extend(item)
+            elif isinstance(item, bool):
+                continue
+            elif isinstance(item, (int, float)):
+                numbers.add(str(item))
+            elif isinstance(item, str):
+                numbers |= _number_tokens(item)
+    return numbers
+
+
 def _is_degenerate_answer(answer: str, tool_history) -> bool:
     """True when a model-produced answer is too thin to trust.
 
-    Two ways an answer can be degenerate: it is too short to say
-    anything (the '11' failure), or it shares no content word with
-    the tool data it claims to answer from (a guess, not an answer).
-    A bare answer with no tool history yet is judged on length alone.
+    Three ways an answer can be degenerate: it is too short to say
+    anything (the '11' failure), it shares no content word with
+    the tool data it claims to answer from (a guess, not an answer),
+    or the tool data is numeric-only and the answer contains none
+    of its numbers. A short answer that shares a content word with
+    the data (a file name like 'setup.py') is grounded, not
+    degenerate -- but a short answer grounded only by a number
+    ('11') is still degenerate, because a bare number is not an
+    answer. A bare answer with no tool history yet is judged on
+    length alone.
     """
     text = (answer or "").strip()
+    if not tool_history:
+        return len(text) < MIN_ANSWER_CHARS
+    words = _tool_result_words(tool_history)
+    numbers = _tool_result_numbers(tool_history)
+    if not words and not numbers:
+        return len(text) < MIN_ANSWER_CHARS
+    if _content_words(text) & words:
+        return False
     if len(text) < MIN_ANSWER_CHARS:
         return True
-    if not tool_history:
-        return False
-    words = _tool_result_words(tool_history)
-    if not words:
-        return False
-    return not (_content_words(text) & words)
+    return not (_number_tokens(text) & numbers)
 
 
 def _fallback_answer(tool_history) -> str:

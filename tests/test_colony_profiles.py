@@ -791,6 +791,61 @@ def test_is_degenerate_answer_catches_short_and_ungrounded():
     assert "qwen" in _content_words("qwen3:30b-a3b-q3k")
 
 
+def test_is_degenerate_answer_numeric_results_and_short_filenames():
+    # Audit M3: the guard ignored numeric-only tool data (a count,
+    # a percentage, disk space -- exactly what check tasks return),
+    # so any answer of 10+ characters passed, even a wrong number.
+    # And it rejected valid short answers like a file name.
+    from agent_farm.agent import (
+        _is_degenerate_answer,
+        _tool_result_numbers,
+    )
+
+    count_history = [{
+        "tool": "check",
+        "args": {},
+        "result": {"count": 42},
+    }]
+    # Numbers from int values ground an answer.
+    assert _tool_result_numbers(count_history) == {"42"}
+    assert not _is_degenerate_answer("There are 42 items", count_history)
+    # A wrong number does not ground it.
+    assert _is_degenerate_answer("There are 99 items", count_history)
+    # A bare number is still not an answer.
+    assert _is_degenerate_answer("42", count_history)
+    # Floats ground the same way, from values and from strings,
+    # and booleans are not numbers.
+    disk_history = [{
+        "tool": "check",
+        "args": {},
+        "result": {"free_gb": 70.41, "ok": True},
+    }]
+    assert _tool_result_numbers(disk_history) == {"70.41"}
+    assert not _is_degenerate_answer("70.41GB free", disk_history)
+    assert _is_degenerate_answer("50GB free", disk_history)
+    str_history = [{
+        "tool": "check",
+        "args": {},
+        "result": {"content": "disk 70.41 GB free"},
+    }]
+    assert _tool_result_numbers(str_history) == {"70.41"}
+    # Negative numbers ground with their minus sign.
+    neg_history = [{
+        "tool": "check",
+        "args": {},
+        "result": {"temp_c": -5},
+    }]
+    assert _tool_result_numbers(neg_history) == {"-5"}
+    assert not _is_degenerate_answer("It is -5 degrees", neg_history)
+    # A short answer that shares a content word is grounded.
+    list_history = [{
+        "tool": "list_dir",
+        "args": {"path": "/tmp"},
+        "result": {"items": ["setup.py", "b.py"], "count": 2},
+    }]
+    assert not _is_degenerate_answer("setup.py", list_history)
+
+
 def test_tool_agent_rejects_degenerate_forced_answer(monkeypatch):
     # The task-12 failure end to end: the scout got a good
     # search_code result, then the forced-answer call returned '11'.
