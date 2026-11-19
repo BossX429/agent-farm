@@ -42,7 +42,8 @@ def test_blocked_paths():
 def test_read_boundary_blocks_home_secrets():
     home = os.path.expanduser("~")
     for secret in (".ssh", ".ssh/id_ed25519", ".aws/credentials",
-                   ".gnupg", ".config", ".mozilla", ".netrc"):
+                   ".gnupg", ".config", ".mozilla", ".netrc",
+                   ".docker", ".docker/config.json", ".kube", ".kube/config"):
         assert not tools.is_path_safe(os.path.join(home, secret)), secret
     # The tools refuse the path instead of probing it: file_exists
     # reports a block, not an existence answer.

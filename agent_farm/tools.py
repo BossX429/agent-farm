@@ -248,9 +248,14 @@ FILE_SWARM_BLOCKED_DIRS = ["/etc", "/usr", "/bin", "/sbin", "/boot", "/root", "/
 # (/home/hatch) and on the PC (C:\Users\kyleh). Each one holds
 # credentials or config a model has no business reading: SSH keys,
 # cloud credentials, GPG keys, app config (including browser
-# profiles), Firefox profiles, and .netrc credentials.
+# profiles), Firefox profiles, .netrc credentials, and Docker and
+# Kubernetes credentials (added after Sourcery's PR #33 review:
+# ~/.docker/config.json exists on the PC and holds registry
+# credentials; ~/.kube does not exist there yet, but it is the same
+# class of file, so it is denied too).
 _HOME_SECRET_DIRS = [
     ".ssh", ".aws", ".gnupg", ".config", ".mozilla", ".netrc",
+    ".docker", ".kube",
 ]
 
 
